@@ -10,7 +10,7 @@ import (
 
 var listCmd = &cobra.Command{
 	Use:   "list",
-	Short: "列出所有容器",
+	Short: "列出容器",
 	Long:  `显示所有 LXC 容器的详细信息，包括名称、状态、IP 地址等。`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		svc := lxc.NewContainerService(core.GetExecutor())

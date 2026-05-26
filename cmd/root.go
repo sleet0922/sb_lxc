@@ -10,8 +10,7 @@ import (
 
 var rootCmd = &cobra.Command{
 	Use:   "sb_lxc",
-	Short: "简化 LXC 容器管理操作",
-	Long:  `sb_lxc 是一个 LXC 管理 CLI 工具，提供简单的命令行接口管理 LXC 容器。`,
+	Short: "LXC 容器管理",
 }
 
 func Execute() {
@@ -23,4 +22,8 @@ func Execute() {
 func init() {
 	core.InitConfig()
 	core.InitLogger()
+
+	// 精简帮助输出
+	rootCmd.CompletionOptions.DisableDefaultCmd = true
+	rootCmd.SilenceUsage = true
 }

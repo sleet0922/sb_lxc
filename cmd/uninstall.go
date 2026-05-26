@@ -14,7 +14,7 @@ import (
 
 var uninstallCmd = &cobra.Command{
 	Use:   "uninstall [容器名]",
-	Short: "删除一个容器",
+	Short: "删除容器",
 	Long:  `永久删除指定的 LXC 容器及其所有数据。`,
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
