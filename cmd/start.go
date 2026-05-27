@@ -12,8 +12,12 @@ var startCmd = &cobra.Command{
 	Use:   "start [容器名]",
 	Short: "启动容器",
 	Long:  `启动一个已创建的 LXC 容器，默认后台运行。`,
-	Args:  cobra.ExactArgs(1),
+	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if len(args) == 0 {
+			listContainers()
+			return nil
+		}
 		name := args[0]
 		svc := lxc.NewContainerService(core.GetExecutor())
 

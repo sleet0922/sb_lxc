@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"sb_lxc/internal/core"
+	"sb_lxc/internal/lxc"
 
 	"github.com/spf13/cobra"
 )
@@ -28,6 +29,16 @@ func init() {
 	rootCmd.SilenceUsage = true
 
 	rootCmd.SetHelpFunc(customHelp)
+}
+
+func listContainers() {
+	svc := lxc.NewContainerService(core.GetExecutor())
+	out, err := svc.ListDetailed()
+	if err != nil {
+		fmt.Printf("获取容器列表失败: %s\n", err)
+		return
+	}
+	fmt.Print(out)
 }
 
 func customHelp(cmd *cobra.Command, args []string) {
