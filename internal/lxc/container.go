@@ -63,13 +63,7 @@ func (s *ContainerService) Autostart() (string, error) {
 
 type ContainerStatus struct {
 	Name      string
-	Autostart string // "enabled", "disabled", "not_set"
-	PortMaps  []PortMapInfo
-}
-
-type PortMapInfo struct {
-	ContainerPort string
-	HostPort      string
+	Autostart string
 }
 
 func (s *ContainerService) Status(name string) (*ContainerStatus, error) {
@@ -83,7 +77,6 @@ func (s *ContainerService) Status(name string) (*ContainerStatus, error) {
 	status := &ContainerStatus{
 		Name:      name,
 		Autostart: "not_set",
-		PortMaps:  []PortMapInfo{},
 	}
 
 	lines := strings.Split(string(content), "\n")
@@ -100,88 +93,9 @@ func (s *ContainerService) Status(name string) (*ContainerStatus, error) {
 				}
 			}
 		}
-
-		if strings.HasPrefix(trimmed, "lxc.hook.pre-start") && strings.Contains(trimmed, "iptables") {
-			// 旧格式: lxc.hook.pre-start = sh -c "iptables ..."
-			dportMatch := extractPort(trimmed, "--dport")
-			destMatch := extractPortAfterColon(trimmed, "--to-destination")
-			if dportMatch != "" && destMatch != "" {
-				status.PortMaps = append(status.PortMaps, PortMapInfo{
-					HostPort:      dportMatch,
-					ContainerPort: destMatch,
-				})
-			}
-		}
-
-		// 新格式: lxc.hook.pre-start = /var/lib/lxc/<name>/port-forward.sh
-		if strings.HasPrefix(trimmed, "lxc.hook.pre-start") && strings.Contains(trimmed, "port-forward.sh") {
-			fields := strings.Fields(trimmed)
-			if len(fields) >= 3 {
-				scriptPath := fields[2]
-				scriptContent, err := os.ReadFile(scriptPath)
-				if err == nil {
-					dportMatch := extractPort(string(scriptContent), "--dport")
-					destMatch := extractPortAfterColon(string(scriptContent), "--to-destination")
-					if dportMatch != "" && destMatch != "" {
-						status.PortMaps = append(status.PortMaps, PortMapInfo{
-							HostPort:      dportMatch,
-							ContainerPort: destMatch,
-						})
-					}
-				}
-			}
-		}
 	}
 
 	return status, nil
-}
-
-func extractPort(s, prefix string) string {
-	idx := strings.Index(s, prefix)
-	if idx == -1 {
-		return ""
-	}
-	after := s[idx+len(prefix):]
-	after = strings.TrimSpace(after)
-	parts := strings.Fields(after)
-	if len(parts) > 0 {
-		return parts[0]
-	}
-	return ""
-}
-
-func extractPortAfterColon(s, prefix string) string {
-	idx := strings.Index(s, prefix)
-	if idx == -1 {
-		return ""
-	}
-	after := s[idx+len(prefix):]
-	after = strings.TrimSpace(after)
-	parts := strings.Fields(after)
-	if len(parts) > 0 {
-		// format: 10.0.3.X:PORT
-		colonIdx := strings.LastIndex(parts[0], ":")
-		if colonIdx != -1 && colonIdx+1 < len(parts[0]) {
-			return parts[0][colonIdx+1:]
-		}
-	}
-	return ""
-}
-
-func (s *ContainerService) GetIP(name string) (string, error) {
-	ip, err := s.exec.Run("lxc-info", "-n", name, "-iH")
-	if err != nil {
-		return "", err
-	}
-	ip = strings.TrimSpace(ip)
-	lines := strings.Split(ip, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, ".") {
-			return line, nil
-		}
-	}
-	return "", fmt.Errorf("未能获取容器 %s 的 IPv4 地址", name)
 }
 
 func (s *ContainerService) SetAutostart(name string, enabled bool) (string, error) {
