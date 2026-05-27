@@ -98,6 +98,22 @@ func (s *ContainerService) Status(name string) (*ContainerStatus, error) {
 	return status, nil
 }
 
+func (s *ContainerService) GetIP(name string) (string, error) {
+	ip, err := s.exec.Run("lxc-info", "-n", name, "-iH")
+	if err != nil {
+		return "", err
+	}
+	ip = strings.TrimSpace(ip)
+	lines := strings.Split(ip, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, ".") {
+			return line, nil
+		}
+	}
+	return "", fmt.Errorf("未能获取容器 %s 的 IPv4 地址", name)
+}
+
 func (s *ContainerService) SetAutostart(name string, enabled bool) (string, error) {
 	configPath := filepath.Join("/var/lib/lxc", name, "config")
 

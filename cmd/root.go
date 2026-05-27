@@ -3,7 +3,6 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"strings"
 
 	"sb_lxc/internal/core"
 
@@ -32,6 +31,9 @@ func init() {
 }
 
 func customHelp(cmd *cobra.Command, args []string) {
+	fmt.Println()
+	fmt.Println("  LXC 容器管理")
+	fmt.Println()
 
 	visible := []*cobra.Command{}
 	for _, c := range cmd.Commands() {
@@ -42,41 +44,10 @@ func customHelp(cmd *cobra.Command, args []string) {
 
 	if len(visible) > 0 {
 		fmt.Println("  可用命令:")
-
-		maxLen := 0
+		fmt.Println()
 		for _, c := range visible {
-			if len(c.Name()) > maxLen {
-				maxLen = len(c.Name())
-			}
+			fmt.Printf("    %s\n", c.Use)
 		}
-		cellW := maxLen + 2
-		totalW := cellW*2 + 3
-		horiz := strings.Repeat("─", totalW)
-
-		printRow := func(left, right string) {
-			left = " " + left + strings.Repeat(" ", cellW-1-len(left))
-			if right != "" {
-				right = " " + right + strings.Repeat(" ", cellW-1-len(right))
-				fmt.Printf("  │%s│%s│\n", left, right)
-			} else {
-				empty := strings.Repeat(" ", cellW)
-				fmt.Printf("  │%s│%s│\n", left, empty)
-			}
-		}
-
-		fmt.Println("  ┌" + horiz + "┐")
-		for i := 0; i < len(visible); i += 2 {
-			left := visible[i].Name()
-			right := ""
-			if i+1 < len(visible) {
-				right = visible[i+1].Name()
-			}
-			printRow(left, right)
-			if i+2 < len(visible) {
-				fmt.Println("  ├" + horiz + "┤")
-			}
-		}
-		fmt.Println("  └" + horiz + "┘")
 	}
 
 	fmt.Println()
