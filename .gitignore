@@ -1,0 +1,5 @@
+# 编译产物
+sb_lxc
+
+# 导出归档
+*.sb_lxc.tar.gz
