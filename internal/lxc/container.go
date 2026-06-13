@@ -22,7 +22,49 @@ func (s *ContainerService) List() (string, error) {
 }
 
 func (s *ContainerService) ListDetailed() (string, error) {
-	return s.exec.Run("lxc-ls", "-f")
+	out, err := s.exec.Run("lxc-ls", "-f")
+	if err != nil {
+		return out, err
+	}
+
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) <= 1 {
+		return "", nil
+	}
+
+	stateMap := map[string]string{
+		"RUNNING": "run",
+		"STOPPED": "stop",
+		"FROZEN":  "frozen",
+	}
+
+	result := []string{}
+	// 自定义表头，去掉 GROUPS 列
+	result = append(result, fmt.Sprintf("%-16s %-6s %-5s %-16s", "NAME", "STATE", "AUTO", "IPV4"))
+
+	for _, line := range lines[1:] {
+		fields := strings.Fields(line)
+		if len(fields) < 7 {
+			continue
+		}
+		name := fields[0]
+
+		state := stateMap[strings.ToUpper(fields[1])]
+		if state == "" {
+			state = strings.ToLower(fields[1])
+		}
+
+		autostart := "no"
+		if fields[2] == "1" {
+			autostart = "yes"
+		}
+
+		ipv4 := fields[4]
+
+		result = append(result, fmt.Sprintf("%-16s %-6s %-5s %-16s", name, state, autostart, ipv4))
+	}
+
+	return strings.Join(result, "\n") + "\n", nil
 }
 
 func (s *ContainerService) Info(name string) (string, error) {

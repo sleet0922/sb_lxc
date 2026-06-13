@@ -30,5 +30,5 @@ var enableCmd = &cobra.Command{
 }
 
 func init() {
-	rootCmd.AddCommand(enableCmd)
+	// 已合并到 set 命令
 }
