@@ -14,11 +14,15 @@ var inCmd = &cobra.Command{
 	Long:  `使用 lxc-attach 进入指定的 LXC 容器。`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if len(args) == 0 {
-			listContainers()
-			return nil
+		name := ""
+		if len(args) > 0 {
+			name = args[0]
+		} else {
+			name = promptSelectContainer()
+			if name == "" {
+				return nil
+			}
 		}
-		name := args[0]
 
 		command := exec.Command("lxc-attach", "-n", name)
 		command.Stdin = os.Stdin

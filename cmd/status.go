@@ -14,9 +14,17 @@ var statusCmd = &cobra.Command{
 	Short: "查看容器状态",
 	Long: `查看容器的各项配置是否生效，包括开机自启。
 会读取容器配置文件并检测相关设置。`,
-	Args: cobra.ExactArgs(1),
+	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		name := args[0]
+		name := ""
+		if len(args) > 0 {
+			name = args[0]
+		} else {
+			name = promptSelectContainer()
+			if name == "" {
+				return nil
+			}
+		}
 		svc := lxc.NewContainerService(core.GetExecutor())
 
 		status, err := svc.Status(name)
@@ -24,16 +32,29 @@ var statusCmd = &cobra.Command{
 			return fmt.Errorf("获取容器状态失败: %w", err)
 		}
 
-		fmt.Printf("容器: %s\n\n", status.Name)
+		fmt.Printf("容器: %s\n", status.Name)
+		fmt.Println()
 
-		fmt.Println("【开机自启】")
+		if status.State != "" {
+			fmt.Printf("  状态: %s\n", status.State)
+		}
+		if status.CPU != "" {
+			fmt.Printf("  CPU:  %s\n", status.CPU)
+		}
+		if status.Memory != "" {
+			fmt.Printf("  内存: %s\n", status.Memory)
+		}
+		if status.State == "" && status.CPU == "" && status.Memory == "" {
+			fmt.Println("  容器未运行")
+		}
+
 		switch status.Autostart {
 		case "enabled":
-			fmt.Println("  状态: 已启用 ✔")
+			fmt.Println("  开机自启: 已启用")
 		case "disabled":
-			fmt.Println("  状态: 已禁用")
+			fmt.Println("  开机自启: 已禁用")
 		default:
-			fmt.Println("  状态: 未设置")
+			fmt.Println("  开机自启: 未设置")
 		}
 
 		return nil

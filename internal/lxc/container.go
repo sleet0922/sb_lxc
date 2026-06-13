@@ -2,9 +2,12 @@ package lxc
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"sb_lxc/internal/core"
 )
@@ -105,39 +108,103 @@ func (s *ContainerService) Autostart() (string, error) {
 
 type ContainerStatus struct {
 	Name      string
+	State     string
 	Autostart string
+	CPU       string
+	Memory    string
 }
 
 func (s *ContainerService) Status(name string) (*ContainerStatus, error) {
-	configPath := filepath.Join("/var/lib/lxc", name, "config")
-
-	content, err := os.ReadFile(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("读取容器配置失败: %w", err)
-	}
-
 	status := &ContainerStatus{
-		Name:      name,
-		Autostart: "not_set",
+		Name: name,
 	}
 
-	lines := strings.Split(string(content), "\n")
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
+	// 从配置文件读取开机自启状态
+	configPath := filepath.Join("/var/lib/lxc", name, "config")
+	if content, err := os.ReadFile(configPath); err == nil {
+		status.Autostart = "not_set"
+		for _, line := range strings.Split(string(content), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "lxc.start.auto") {
+				fields := strings.Fields(trimmed)
+				if len(fields) >= 3 {
+					if fields[2] == "1" {
+						status.Autostart = "enabled"
+					} else {
+						status.Autostart = "disabled"
+					}
+				}
+			}
+		}
+	}
 
-		if strings.HasPrefix(trimmed, "lxc.start.auto") {
-			fields := strings.Fields(trimmed)
-			if len(fields) >= 3 {
-				if fields[2] == "1" {
-					status.Autostart = "enabled"
+	// 从 lxc-info 获取运行状态
+	info, err := s.exec.Run("lxc-info", "-n", name)
+	if err == nil {
+		for _, line := range strings.Split(info, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "State:") {
+				status.State = strings.TrimSpace(strings.TrimPrefix(line, "State:"))
+			}
+		}
+	}
+
+	// 从 cgroup v2 读取 CPU 和内存（仅在容器运行时）
+	if status.State == "RUNNING" {
+		cgPath := "/sys/fs/cgroup/lxc.payload." + name
+		memPath := filepath.Join(cgPath, "memory.current")
+
+		// CPU: 采样两次 cpu.stat，计算实时 CPU%
+		cpuStatPath := filepath.Join(cgPath, "cpu.stat")
+		sample1 := readUsageUsec(cpuStatPath)
+		if sample1 > 0 {
+			time.Sleep(500 * time.Millisecond)
+			sample2 := readUsageUsec(cpuStatPath)
+			if sample2 > sample1 {
+				delta := sample2 - sample1
+				cpuPct := float64(delta) / 5_000 // 500ms = 500000us, so delta/500000*100 = delta/5000
+				status.CPU = fmt.Sprintf("%.1f%%", cpuPct)
+			} else {
+				status.CPU = "< 0.1%"
+			}
+		}
+
+		// 内存: 读取 memory.current
+		if data, err := os.ReadFile(memPath); err == nil {
+			if bytes, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64); err == nil {
+				mib := float64(bytes) / 1024 / 1024
+				if mib < 1 {
+					kib := math.Round(float64(bytes)/1024*10) / 10
+					status.Memory = fmt.Sprintf("%.1f KiB", kib)
 				} else {
-					status.Autostart = "disabled"
+					status.Memory = fmt.Sprintf("%.1f MiB", math.Round(mib*10)/10)
 				}
 			}
 		}
 	}
 
 	return status, nil
+}
+
+// readUsageUsec 从 cpu.stat 读取 usage_usec 值
+func readUsageUsec(path string) uint64 {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "usage_usec") {
+			fields := strings.Fields(line)
+			if len(fields) == 2 {
+				val, err := strconv.ParseUint(fields[1], 10, 64)
+				if err == nil {
+					return val
+				}
+			}
+			break
+		}
+	}
+	return 0
 }
 
 func (s *ContainerService) GetIP(name string) (string, error) {

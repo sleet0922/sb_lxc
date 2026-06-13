@@ -14,11 +14,15 @@ var stopCmd = &cobra.Command{
 	Long:  `关停一个正在运行的 LXC 容器。`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if len(args) == 0 {
-			listContainers()
-			return nil
+		name := ""
+		if len(args) > 0 {
+			name = args[0]
+		} else {
+			name = promptSelectContainer()
+			if name == "" {
+				return nil
+			}
 		}
-		name := args[0]
 		svc := lxc.NewContainerService(core.GetExecutor())
 
 		out, err := svc.Stop(name, false)
