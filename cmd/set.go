@@ -206,7 +206,6 @@ fi
 						}
 						_, portAction, err := portActionPrompt.Run()
 						if err != nil {
-							// ESC 返回容器选择
 							continue chooseContainer
 						}
 
@@ -259,7 +258,7 @@ fi
 							}
 
 							if err := lxc.EnsurePortForwardService(); err != nil {
-								fmt.Printf("警告: 创建 systemd 服务失败: %v\n", err)
+								fmt.Printf("警告: %v\n", err)
 							}
 							exec.Command("systemctl", "enable", "sb-lxc-port@"+name+".service").Run()
 
