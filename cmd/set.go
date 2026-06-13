@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"sb_lxc/internal/core"
@@ -17,7 +18,7 @@ import (
 var setCmd = &cobra.Command{
 	Use:   "set",
 	Short: "容器配置",
-	Long: `交互式配置容器，支持开机自启和域名映射。
+	Long: `交互式配置容器，支持开机自启、域名映射和端口映射。
 使用上下键选择，回车确认。`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		svc := lxc.NewContainerService(core.GetExecutor())
@@ -38,7 +39,7 @@ var setCmd = &cobra.Command{
 			Label: "{{ . }}",
 		}
 
-		actions := []string{"启用开机自启", "禁用开机自启", "域名映射"}
+		actions := []string{"启用开机自启", "禁用开机自启", "域名映射", "端口映射"}
 
 		for {
 			// 选择操作
@@ -190,6 +191,135 @@ fi
 						fmt.Printf("已将容器 %s 映射到域名 %s（容器启动后将自动更新 hosts）\n", name, domain)
 					}
 					return nil
+
+				case "端口映射":
+					portActions := []string{"添加端口映射", "查看端口映射", "删除端口映射"}
+
+				portActionLoop:
+					for {
+						portActionPrompt := promptui.Select{
+							Label:        "请选择端口映射操作",
+							Items:        portActions,
+							Templates:    selTemplate,
+							HideHelp:     true,
+							HideSelected: true,
+						}
+						_, portAction, err := portActionPrompt.Run()
+						if err != nil {
+							// ESC 返回容器选择
+							continue chooseContainer
+						}
+
+						switch portAction {
+						case "添加端口映射":
+							cprompt := promptui.Prompt{
+								Label: "请输入容器端口",
+								Templates: &promptui.PromptTemplates{
+									Prompt:  "{{ . }} ",
+									Success: "",
+								},
+								Validate: func(input string) error {
+									port, err := strconv.Atoi(strings.TrimSpace(input))
+									if err != nil || port < 1 || port > 65535 {
+										return fmt.Errorf("请输入有效的端口号 (1-65535)")
+									}
+									return nil
+								},
+							}
+							cportStr, err := cprompt.Run()
+							if err != nil {
+								continue portActionLoop
+							}
+							cport, _ := strconv.Atoi(strings.TrimSpace(cportStr))
+
+							hprompt := promptui.Prompt{
+								Label: "请输入宿主机端口",
+								Templates: &promptui.PromptTemplates{
+									Prompt:  "{{ . }} ",
+									Success: "",
+								},
+								Validate: func(input string) error {
+									port, err := strconv.Atoi(strings.TrimSpace(input))
+									if err != nil || port < 1 || port > 65535 {
+										return fmt.Errorf("请输入有效的端口号 (1-65535)")
+									}
+									return nil
+								},
+							}
+							hportStr, err := hprompt.Run()
+							if err != nil {
+								continue portActionLoop
+							}
+							hport, _ := strconv.Atoi(strings.TrimSpace(hportStr))
+
+							netSvc := lxc.NewNetworkService(core.GetExecutor())
+							if err := netSvc.AddPortForward(name, cport, hport); err != nil {
+								fmt.Printf("添加端口映射失败: %v\n", err)
+								return nil
+							}
+
+							if err := lxc.EnsurePortForwardService(); err != nil {
+								fmt.Printf("警告: 创建 systemd 服务失败: %v\n", err)
+							}
+							exec.Command("systemctl", "enable", "sb-lxc-port@"+name+".service").Run()
+
+							fmt.Printf("已将容器 %s 的 %d 端口映射到宿主机 %d 端口\n", name, cport, hport)
+							return nil
+
+						case "查看端口映射":
+							netSvc := lxc.NewNetworkService(core.GetExecutor())
+							forwards, err := netSvc.ListPortForwards(name)
+							if err != nil {
+								fmt.Printf("获取端口映射失败: %v\n", err)
+								continue chooseContainer
+							}
+							if len(forwards) == 0 {
+								fmt.Printf("容器 %s 没有端口映射\n", name)
+								continue chooseContainer
+							}
+							fmt.Printf("容器 %s 的端口映射:\n", name)
+							for _, pf := range forwards {
+								fmt.Printf("  宿主机 %d -> 容器 %d\n", pf.HostPort, pf.ContainerPort)
+							}
+							return nil
+
+						case "删除端口映射":
+							netSvc := lxc.NewNetworkService(core.GetExecutor())
+							forwards, err := netSvc.ListPortForwards(name)
+							if err != nil {
+								fmt.Printf("获取端口映射失败: %v\n", err)
+								continue chooseContainer
+							}
+							if len(forwards) == 0 {
+								fmt.Printf("容器 %s 没有端口映射\n", name)
+								continue chooseContainer
+							}
+
+							var items []string
+							for _, pf := range forwards {
+								items = append(items, fmt.Sprintf("宿主机 %d -> 容器 %d", pf.HostPort, pf.ContainerPort))
+							}
+
+							delPrompt := promptui.Select{
+								Label:        "请选择要删除的映射",
+								Items:        items,
+								Templates:    selTemplate,
+								HideHelp:     true,
+								HideSelected: true,
+							}
+							idx, _, err := delPrompt.Run()
+							if err != nil {
+								continue portActionLoop
+							}
+
+							if err := netSvc.RemovePortForward(name, forwards[idx].HostPort); err != nil {
+								fmt.Printf("删除端口映射失败: %v\n", err)
+								return nil
+							}
+							fmt.Printf("已删除宿主机 %d 端口的映射\n", forwards[idx].HostPort)
+							return nil
+						}
+					}
 				}
 			}
 		}
