@@ -35,6 +35,10 @@ var exportCmd = &cobra.Command{
 			}
 		}
 
+		if err := requireContainer(name); err != nil {
+			return err
+		}
+
 		output := exportOutput
 		if output == "" {
 			output = name + ".sb_lxc.tar.gz"
@@ -43,22 +47,6 @@ var exportCmd = &cobra.Command{
 		// 确保输出路径是绝对路径或相对于当前目录
 		if !filepath.IsAbs(output) && !strings.HasPrefix(output, "./") && !strings.HasPrefix(output, "../") {
 			output = "./" + output
-		}
-
-		// 检查容器是否存在
-		containers, err := getContainerNames()
-		if err != nil {
-			return fmt.Errorf("获取容器列表失败: %w", err)
-		}
-		found := false
-		for _, c := range containers {
-			if c == name {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return fmt.Errorf("容器 %s 不存在", name)
 		}
 
 		fmt.Printf("正在导出容器 %s ...\n", name)

@@ -34,7 +34,7 @@ var startCmd = &cobra.Command{
 	Use:   "start [容器名]",
 	Short: "启动容器",
 	Long:  `启动一个已创建的 LXC 容器，默认后台运行。`,
-	Args: cobra.MaximumNArgs(1),
+	Args:  cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// 自动修复 lxc-net 注入的错误默认路由
 		fixLxcbr0Route()
@@ -48,11 +48,20 @@ var startCmd = &cobra.Command{
 				return nil
 			}
 		}
+
+		if err := requireContainer(name); err != nil {
+			return err
+		}
+		state := containerState(name)
+		if state == "RUNNING" {
+			return fmt.Errorf("容器 %s 已在运行", name)
+		}
+
 		svc := lxc.NewContainerService(core.GetExecutor())
 
 		out, err := svc.Start(name, true)
 		if err != nil {
-			return fmt.Errorf("启动容器失败: %w\n%s", err, out)
+			return fmt.Errorf("启动容器失败: %s", out)
 		}
 		fmt.Printf("容器 %s 已启动\n", name)
 

@@ -16,7 +16,7 @@ var uninstallCmd = &cobra.Command{
 	Use:   "uninstall [容器名]",
 	Short: "删除容器",
 	Long:  `永久删除指定的 LXC 容器及其所有数据。`,
-	Args: cobra.MaximumNArgs(1),
+	Args:  cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		name := ""
 		if len(args) > 0 {
@@ -27,6 +27,16 @@ var uninstallCmd = &cobra.Command{
 				return nil
 			}
 		}
+
+		if err := requireContainer(name); err != nil {
+			return err
+		}
+
+		state := containerState(name)
+		if state == "RUNNING" {
+			return fmt.Errorf("容器 %s 正在运行，请先停止容器", name)
+		}
+
 		force, _ := cmd.Flags().GetBool("force")
 
 		if !force {
@@ -45,7 +55,7 @@ var uninstallCmd = &cobra.Command{
 		svc := lxc.NewContainerService(core.GetExecutor())
 		out, err := svc.Destroy(name)
 		if err != nil {
-			return fmt.Errorf("删除容器失败: %w\n%s", err, out)
+			return fmt.Errorf("删除容器失败: %s", out)
 		}
 		fmt.Println(out)
 		fmt.Printf("容器 %s 已删除。\n", name)

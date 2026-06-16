@@ -25,6 +25,11 @@ var statusCmd = &cobra.Command{
 				return nil
 			}
 		}
+
+		if err := requireContainer(name); err != nil {
+			return err
+		}
+
 		svc := lxc.NewContainerService(core.GetExecutor())
 
 		status, err := svc.Status(name)
