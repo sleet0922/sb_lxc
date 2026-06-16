@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 
 	"sb_lxc/internal/core"
@@ -24,6 +25,7 @@ func Execute() {
 }
 
 func init() {
+	ensureDeps()
 	core.InitConfig()
 	core.InitLogger()
 
@@ -97,4 +99,36 @@ func promptSelectContainer() string {
 		return "" // ESC
 	}
 	return name
+}
+
+// ensureDeps 检查并安装 LXC 所需的系统依赖包
+func ensureDeps() {
+	pkgs := []string{"lxc", "lxc-templates", "bridge-utils", "uidmap"}
+	var missing []string
+	for _, pkg := range pkgs {
+		if _, err := exec.LookPath("dpkg-query"); err == nil {
+			out, _ := exec.Command("dpkg-query", "-W", "-f=${Status}", pkg).Output()
+			if !strings.HasPrefix(string(out), "install ok installed") {
+				missing = append(missing, pkg)
+			}
+		} else {
+			// fallback: 检查 /var/lib/dpkg/info
+			if _, err := os.Stat("/var/lib/dpkg/info/" + pkg + ".list"); err != nil {
+				missing = append(missing, pkg)
+			}
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	fmt.Printf("正在安装缺少的依赖: %s\n", strings.Join(missing, " "))
+	cmd := exec.Command("apt-get", "install", "-y")
+	cmd.Args = append(cmd.Args, missing...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "安装依赖失败: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("依赖安装完成")
 }
