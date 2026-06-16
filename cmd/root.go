@@ -50,7 +50,7 @@ func listContainers() {
 
 func customHelp(cmd *cobra.Command, args []string) {
 	// 按指定顺序显示命令
-	order := []string{"in", "start", "stop", "list", "status", "set", "install", "uninstall", "export", "import"}
+	order := []string{"in", "start", "stop", "kill", "list", "status", "set", "install", "uninstall", "export", "import"}
 
 	// 建立 name -> command 的映射
 	cmdMap := make(map[string]*cobra.Command)
