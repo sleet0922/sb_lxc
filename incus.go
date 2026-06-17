@@ -80,11 +80,17 @@ func (c *IncusClient) capture(args ...string) ([]byte, error) {
 	return cmd.Output()
 }
 
-// EnsureMirrorRemote 添加清华镜像源，已存在则忽略。
+// EnsureMirrorRemote 确保系统只保留清华镜像源：移除官方 images 源与可能指向
+// 其他地址的旧 mirror-images，再添加指向清华源的 mirror-images。
+// local 为本地 daemon，不在处理范围内。所有删除/添加错误均忽略（幂等）。
 func (c *IncusClient) EnsureMirrorRemote() {
-	cmd := exec.Command("incus", "remote", "add", MirrorRemote, MirrorURL,
-		"--protocol=simplestreams", "--public")
-	_ = cmd.Run() // 已存在会报错，忽略
+	// 移除官方 images 源（不存在或不可删则忽略）
+	_ = exec.Command("incus", "remote", "remove", "images").Run()
+	// 移除旧 mirror-images（可能指向非清华源），忽略错误
+	_ = exec.Command("incus", "remote", "remove", MirrorRemote).Run()
+	// 添加清华镜像源
+	_ = exec.Command("incus", "remote", "add", MirrorRemote, MirrorURL,
+		"--protocol=simplestreams", "--public").Run()
 }
 
 // ──────────────────── 生命周期 ────────────────────

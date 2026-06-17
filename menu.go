@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -19,6 +20,16 @@ func selectMenu(options []string, prompt string) int {
 		return fallbackSelect(options, prompt)
 	}
 	defer restoreTerm(fd, old)
+
+	// 兜底：若 SIGINT/SIGTERM 来自外部（如 kill -INT），确保恢复终端后再退出
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		restoreTerm(fd, old)
+		os.Exit(130)
+	}()
+	defer signal.Stop(sigCh)
 
 	m := &menu{out: os.Stdout}
 	m.render(options, 0, prompt)
@@ -136,9 +147,11 @@ func makeRaw(fd int) (*syscall.Termios, error) {
 		return nil, err
 	}
 	raw := old
-	// 只关回显和规范模式，保留 OPOST 使 \n 正常转 \r\n
+	// 关回显、规范模式与信号产生；保留 OPOST 使 \n 正常转 \r\n。
+	// 清除 ISIG 后 Ctrl+C 不再触发 SIGINT，而是作为字节 0x03 被读取，
+	// 避免进程被信号杀死导致 defer restoreTerm 来不及执行。
 	raw.Iflag &^= syscall.IXON | syscall.BRKINT
-	raw.Lflag &^= syscall.ECHO | syscall.ICANON | syscall.IEXTEN
+	raw.Lflag &^= syscall.ECHO | syscall.ICANON | syscall.IEXTEN | syscall.ISIG
 	raw.Cflag &^= syscall.CSIZE
 	raw.Cflag |= syscall.CS8
 	raw.Cc[syscall.VMIN] = 1

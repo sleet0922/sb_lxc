@@ -15,14 +15,14 @@ const MirrorRemote = "mirror-images"
 const MirrorURL = "https://mirrors.tuna.tsinghua.edu.cn/lxc-images/"
 
 func main() {
+	// 每次启动都先确保只保留清华镜像源（移除官方 images 源与旧 mirror-images）
+	client := NewIncusClient()
+	client.EnsureMirrorRemote()
+
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(0)
 	}
-
-	// 每次启动都确保镜像源已添加（已存在则忽略错误）
-	client := NewIncusClient()
-	client.EnsureMirrorRemote()
 
 	cmd := os.Args[1]
 	args := os.Args[2:]
