@@ -1,0 +1,43 @@
+初始化
+incus admin init
+
+换源
+incus remote add mirror-images https://mirrors.tuna.tsinghua.edu.cn/lxc-images/ --protocol=simplestreams --public
+
+列出可用镜像
+incus image list mirror-images:
+
+安装镜像
+ incus launch local:alpine-3.21 alpine
+
+列出已安装容器
+incus list
+
+启动容器
+incus start 容器名
+
+停止容器
+incus stop 容器名
+
+开启 开机自启动
+incus config set 容器 boot.autostart true
+
+关闭 开机自启动
+incus config set 容器 boot.autostart false
+
+进入容器
+incus exec alpine -- /bin/sh
+
+端口映射
+incus config device add 容器名 webproxy proxy listen=tcp:0.0.0.0:8080 connect=tcp:127.0.0.1:80
+
+取消端口映射
+incus config device remove 容器名 webproxy
+
+导出容器
+incus export 容器名 ./容器名.tar.gz
+
+导入容器
+incus import ./容器名.tar.gz 新容器名
+
+
