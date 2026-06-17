@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -95,17 +96,58 @@ func (c *IncusClient) EnsureMirrorRemote() {
 
 // ──────────────────── 生命周期 ────────────────────
 
-func (c *IncusClient) Start(name string) error { return c.run("start", name) }
-func (c *IncusClient) Stop(name string) error  { return c.run("stop", name) }
+func (c *IncusClient) Start(name string) error {
+	// 启动前重新生成 eth0 的 MAC 地址，避免从同一来源复制的容器 MAC 冲突
+	_ = c.regenerateMAC(name)
+	return c.run("start", name)
+}
 
-// Exec 进入容器，依次尝试 sh / bash。
+// regenerateMAC 为容器 eth0 设备生成新的随机 MAC 地址。
+// eth0 可能定义在 profile 中，需先 add 覆盖到容器级别，再 set 更新 MAC。
+func (c *IncusClient) regenerateMAC(name string) error {
+	mac, err := randomMAC()
+	if err != nil {
+		return err
+	}
+	// 先尝试 set（若容器级别已有 eth0 覆盖）
+	if exec.Command("incus", "config", "device", "set", name, "eth0", "hwaddr="+mac).Run() == nil {
+		return nil
+	}
+	// 否则用 add 覆盖 profile 中的 eth0 设备
+	return exec.Command("incus", "config", "device", "add", name, "eth0", "nic",
+		"name=eth0", "network=incusbr0", "hwaddr="+mac).Run()
+}
+// randomMAC 生成一个本地管理的随机 MAC 地址。
+func randomMAC() (string, error) {
+	buf := make([]byte, 6)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	// 设置本地管理位 (bit 1 of first byte)，清除多播位 (bit 0)
+	buf[0] = (buf[0] | 0x02) & 0xfe
+	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]), nil
+}
+func (c *IncusClient) Stop(name string) error   { return c.run("stop", name) }
+func (c *IncusClient) Delete(name string) error  { return c.run("delete", name, "--force") }
+
+// Exec 进入容器，用 syscall.Exec 替换当前进程以确保终端完全交给 incus。
 func (c *IncusClient) Exec(name string) error {
-	for _, sh := range []string{"/bin/sh", "/bin/bash"} {
-		if err := c.run("exec", name, "--", sh); err == nil {
+	bin, err := exec.LookPath("incus")
+	if err != nil {
+		return fmt.Errorf("找不到 incus 命令: %w", err)
+	}
+	// 优先用 bash（支持方向键/Tab补全/历史记录），容器内无 bash 时回退到 sh
+	for _, sh := range []string{"/bin/bash", "/bin/sh"} {
+		// 通过 incus exec 透传 stdio：bash 不存在时 incus 会返回非零，回退尝试下一个
+		cmd := exec.Command(bin, "exec", "-t", name, "--", sh)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err == nil {
 			return nil
 		}
 	}
-	return fmt.Errorf("无法进入容器 %s", name)
+	return fmt.Errorf("无法进入容器 %s 的 shell", name)
 }
 
 // Launch 从镜像源启动新容器。

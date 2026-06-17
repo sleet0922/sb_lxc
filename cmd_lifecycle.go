@@ -1,6 +1,9 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"path/filepath"
+)
 
 // CmdStart 启动容器，若配置了域名映射则自动更新 /etc/hosts。
 func CmdStart(name string) error {
@@ -33,6 +36,26 @@ func CmdStart(name string) error {
 	return nil
 }
 
+// CmdUninstall 交互式选择并删除容器。
+func CmdUninstall() error {
+	name, err := selectContainer("选择要删除的容器")
+	if err != nil {
+		return err
+	}
+	if name == "" {
+		return nil
+	}
+	client := NewIncusClient()
+	fmt.Printf("停止容器 %s ...\n", name)
+	_ = client.Stop(name)
+	fmt.Printf("删除容器 %s ...\n", name)
+	if err := client.Delete(name); err != nil {
+		return err
+	}
+	fmt.Printf("✔ 容器 %s 已删除\n", name)
+	return nil
+}
+
 // CmdStop 停止容器。
 func CmdStop(name string) error {
 	fmt.Printf("停止容器 %s ...\n", name)
@@ -55,13 +78,24 @@ func CmdExport(name string) error {
 	return nil
 }
 
-// CmdImport 从备份文件导入容器，args: [文件路径] [新容器名]
+// CmdImport 从备份文件导入容器。有参数则直接使用，无参数则扫描当前目录 .tar.gz 供选择。
 func CmdImport(args []string) error {
-	if len(args) < 1 {
-		return fmt.Errorf("用法: sb_lxc import <文件路径> [新容器名]")
-	}
-	path := args[0]
+	path := ""
 	name := ""
+	if len(args) >= 1 {
+		path = args[0]
+	} else {
+		// 扫描当前目录下的 .tar.gz 文件
+		matches, _ := filepath.Glob("*.tar.gz")
+		if len(matches) == 0 {
+			return fmt.Errorf("当前目录未找到 .tar.gz 文件")
+		}
+		choice := selectMenu(matches, "选择要导入的文件 (↑↓ 选择, Enter 确认, q 退出)")
+		if choice < 0 {
+			return nil
+		}
+		path = matches[choice]
+	}
 	if len(args) >= 2 {
 		name = args[1]
 	}
