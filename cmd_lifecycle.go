@@ -3,18 +3,27 @@ package main
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 )
 
 // CmdStart 启动容器，若配置了域名映射则自动更新 /etc/hosts。
 func CmdStart(name string) error {
 	client := NewIncusClient()
-	fmt.Printf("启动容器 %s ...\n", name)
-	if err := client.Start(name); err != nil {
-		return err
+
+	// 容器已在运行则跳过启动，继续处理域名逻辑
+	ct, _ := client.GetContainer(name)
+	if ct != nil && strings.EqualFold(ct.Status, "Running") {
+		fmt.Printf("ℹ 容器 %s 已在运行\n", name)
+	} else {
+		fmt.Printf("启动容器 %s ...\n", name)
+		if err := client.Start(name); err != nil {
+			return err
+		}
+		// 重新获取容器信息以读取域名配置
+		ct, _ = client.GetContainer(name)
 	}
 
 	// 检查域名映射，有则等待 IP 并更新 /etc/hosts
-	ct, _ := client.GetContainer(name)
 	domain := ""
 	if ct != nil {
 		domain = ct.Domain()

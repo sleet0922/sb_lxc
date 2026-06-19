@@ -21,6 +21,8 @@ func CmdSet(name string) error {
 		"取消端口映射",
 		"域名映射",
 		"取消域名映射",
+		"挂载文件夹",
+		"取消挂载",
 		"开机自启动",
 		"关闭开机自启动",
 	}
@@ -42,11 +44,15 @@ func CmdSet(name string) error {
 	case 3:
 		return removeDomain(client, ct)
 	case 4:
+		return addMount(client, ct)
+	case 5:
+		return removeMount(client, ct)
+	case 6:
 		if err := client.SetBootAutostart(name, true); err != nil {
 			return err
 		}
 		fmt.Printf("✔ 容器 %s 已开启开机自启动\n", name)
-	case 5:
+	case 7:
 		if err := client.SetBootAutostart(name, false); err != nil {
 			return err
 		}

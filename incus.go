@@ -130,24 +130,28 @@ func randomMAC() (string, error) {
 func (c *IncusClient) Stop(name string) error   { return c.run("stop", name) }
 func (c *IncusClient) Delete(name string) error  { return c.run("delete", name, "--force") }
 
-// Exec 进入容器，用 syscall.Exec 替换当前进程以确保终端完全交给 incus。
+// Exec 进入容器，优先用 bash（支持方向键/Tab补全/历史记录），无则回退 sh。
+// 先静默探测可用 shell，避免回退时打印迷惑的 "Command not found" 错误。
 func (c *IncusClient) Exec(name string) error {
 	bin, err := exec.LookPath("incus")
 	if err != nil {
 		return fmt.Errorf("找不到 incus 命令: %w", err)
 	}
-	// 优先用 bash（支持方向键/Tab补全/历史记录），容器内无 bash 时回退到 sh
+	shell := "/bin/sh"
 	for _, sh := range []string{"/bin/bash", "/bin/sh"} {
-		// 通过 incus exec 透传 stdio：bash 不存在时 incus 会返回非零，回退尝试下一个
-		cmd := exec.Command(bin, "exec", "-t", name, "--", sh)
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err == nil {
-			return nil
+		if err := exec.Command(bin, "exec", name, "--", "test", "-x", sh).Run(); err == nil {
+			shell = sh
+			break
 		}
 	}
-	return fmt.Errorf("无法进入容器 %s 的 shell", name)
+	cmd := exec.Command(bin, "exec", "-t", name, "--", shell)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("无法进入容器 %s 的 shell: %w", name, err)
+	}
+	return nil
 }
 
 // Launch 从镜像源启动新容器。
@@ -211,6 +215,14 @@ func (c *IncusClient) AddProxyDevice(name, device, listen, connect string) error
 		"listen="+listen, "connect="+connect)
 }
 
+// AddDiskDevice 添加磁盘设备，把宿主机目录挂载到容器（双向共享）。
+// shift=true 启用 idmapped mount，使非特权容器的 uid/gid 自动映射，
+// 容器内 root 可正常读写宿主机文件，反之亦然。
+func (c *IncusClient) AddDiskDevice(name, device, source, path string) error {
+	return c.run("config", "device", "add", name, device, "disk",
+		"source="+source, "path="+path, "shift=true")
+}
+
 // RemoveDevice 移除设备。
 func (c *IncusClient) RemoveDevice(name, device string) error {
 	return c.run("config", "device", "remove", name, device)
@@ -239,6 +251,25 @@ func (ct *Container) ProxyDevices() map[string]map[string]string {
 		if v["type"] == "proxy" {
 			result[k] = v
 		}
+	}
+	return result
+}
+
+// MountDevices 从展开设备中提取所有挂载用磁盘设备（排除根盘）。
+func (ct *Container) MountDevices() map[string]map[string]string {
+	result := map[string]map[string]string{}
+	devs := ct.ExpandedDevices
+	if devs == nil {
+		devs = ct.Devices
+	}
+	for k, v := range devs {
+		if v["type"] != "disk" {
+			continue
+		}
+		if v["path"] == "/" || v["source"] == "" {
+			continue
+		}
+		result[k] = v
 	}
 	return result
 }
