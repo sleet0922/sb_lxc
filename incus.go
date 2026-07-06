@@ -76,9 +76,17 @@ func (c *IncusClient) run(args ...string) error {
 }
 
 // capture 执行 incus 子命令并返回 stdout（不接管 stdio）。
+// 出错时附带 stderr 输出，便于排查。
 func (c *IncusClient) capture(args ...string) ([]byte, error) {
 	cmd := exec.Command("incus", args...)
-	return cmd.Output()
+	out, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && len(exitErr.Stderr) > 0 {
+			return nil, fmt.Errorf("%s\n%s", err, strings.TrimSpace(string(exitErr.Stderr)))
+		}
+		return nil, err
+	}
+	return out, nil
 }
 
 // EnsureMirrorRemote 确保系统只保留清华镜像源：移除官方 images 源与可能指向

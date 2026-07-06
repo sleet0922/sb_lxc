@@ -11,8 +11,8 @@ const Version = "1.0.0"
 // MirrorRemote 镜像源在本地的 remote 名称
 const MirrorRemote = "mirror-images"
 
-// MirrorURL 清华大学 LXC 镜像源地址
-const MirrorURL = "https://mirrors.tuna.tsinghua.edu.cn/lxc-images/"
+// MirrorURL LXC 镜像源地址（清华源已失效，改用官方源）
+const MirrorURL = "https://images.linuxcontainers.org/"
 
 func main() {
 	// 每次启动都先确保只保留清华镜像源（移除官方 images 源与旧 mirror-images）
