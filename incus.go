@@ -110,7 +110,7 @@ func (c *IncusClient) EnsureMirrorRemote() {
 // ──────────────────── 生命周期 ────────────────────
 
 func (c *IncusClient) Start(name string) error {
-	// 启动前重新配置 eth0，确保使用 macvlan 直连物理网卡且 MAC 不冲突。
+	// 启动前重新配置 eth0，确保使用 macvlan 直连物理网卡，同时保留已有容器 MAC。
 	if err := c.configureMacvlanNIC(name); err != nil {
 		return fmt.Errorf("配置 %s macvlan 网络失败: %w", defaultNICName, err)
 	}
@@ -119,11 +119,19 @@ func (c *IncusClient) Start(name string) error {
 
 // configureMacvlanNIC 配置容器 eth0 使用 macvlan 直连物理网卡。
 // 默认 profile 里可能继承了 incusbr0，这里用容器级 eth0 覆盖它，避免 NAT。
+// 注意：这里只配置容器虚拟网卡，不会修改宿主机物理网卡 ens18 的 MAC。
 func (c *IncusClient) configureMacvlanNIC(name string) error {
-	mac, err := randomMAC()
+	mac, err := c.containerNICMAC(name, defaultNICName)
 	if err != nil {
 		return err
 	}
+	if mac == "" {
+		mac, err = randomMAC()
+		if err != nil {
+			return err
+		}
+	}
+
 	args := []string{
 		"name=" + defaultNICName,
 		"nictype=macvlan",
@@ -132,12 +140,46 @@ func (c *IncusClient) configureMacvlanNIC(name string) error {
 	}
 	// 先移除容器级 eth0（若存在），再优先覆盖 profile 继承的 eth0。
 	// 若没有继承设备，override 会失败，随后 add 会创建新的容器级 eth0。
+	// 移除前已经读取并保留原 hwaddr，避免每次启动/重新配置都换容器 MAC。
 	_ = exec.Command("incus", "config", "device", "remove", name, defaultNICName).Run()
 	if exec.Command("incus", append([]string{"config", "device", "override", name, defaultNICName}, args...)...).Run() == nil {
 		_ = exec.Command("incus", "config", "device", "unset", name, defaultNICName, "network").Run()
 		return nil
 	}
 	return exec.Command("incus", append([]string{"config", "device", "add", name, defaultNICName, "nic"}, args...)...).Run()
+}
+
+// containerNICMAC 返回容器网卡已有 MAC，优先保留容器配置/运行态中的地址。
+// 这样重新应用 macvlan 配置时不会导致容器 DHCP 身份变化。
+func (c *IncusClient) containerNICMAC(name, nic string) (string, error) {
+	ct, err := c.GetContainer(name)
+	if err != nil {
+		return "", err
+	}
+
+	for _, devs := range []map[string]map[string]string{ct.Devices, ct.ExpandedDevices} {
+		if dev := devs[nic]; dev != nil {
+			if mac := strings.TrimSpace(dev["hwaddr"]); mac != "" {
+				return mac, nil
+			}
+		}
+	}
+
+	if ct.Config != nil {
+		if mac := strings.TrimSpace(ct.Config["volatile."+nic+".hwaddr"]); mac != "" {
+			return mac, nil
+		}
+	}
+
+	if ct.State != nil && ct.State.Network != nil {
+		if state, ok := ct.State.Network[nic]; ok {
+			if mac := strings.TrimSpace(state.HwAddr); mac != "" {
+				return mac, nil
+			}
+		}
+	}
+
+	return "", nil
 }
 
 // randomMAC 生成一个本地管理的随机 MAC 地址。

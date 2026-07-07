@@ -23,17 +23,24 @@ func CmdStart(name string) error {
 		ct, _ = client.GetContainer(name)
 	}
 
-	// 检查域名映射，有则等待 IP 并更新 /etc/hosts
+	// 等待容器 IPv4，并自动补齐宿主机侧 macvlan shim 路由。
+	ip := ""
 	domain := ""
 	if ct != nil {
+		ip = ct.IPv4()
 		domain = ct.Domain()
 	}
+	if ip == "" {
+		ip = waitForIP(client, name, 15)
+	}
+	if ip != "" {
+		warnAutoHostMacvlan(AutoConfigureHostMacvlan(client))
+	}
+
+	// 检查域名映射，有则更新 /etc/hosts。
 	if domain == "" {
 		return nil
 	}
-
-	fmt.Printf("检测到域名映射 %s，等待容器获取 IP ...\n", domain)
-	ip := waitForIP(client, name, 15)
 	if ip == "" {
 		fmt.Printf("⚠ 容器未获取到 IPv4，跳过 hosts 更新\n")
 		return nil
@@ -133,6 +140,7 @@ func CmdImport(args []string) error {
 			return err
 		}
 	}
+	warnAutoHostMacvlan(AutoConfigureHostMacvlan(client))
 	fmt.Printf("✔ 导入完成\n")
 	return nil
 }

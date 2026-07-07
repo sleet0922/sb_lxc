@@ -54,6 +54,12 @@ func CmdInstall() error {
 	if err := client.Launch(imageRef, name); err != nil {
 		return err
 	}
+
+	ip := waitForIP(client, name, 15)
+	if ip != "" {
+		warnAutoHostMacvlan(AutoConfigureHostMacvlan(client))
+	}
+
 	fmt.Printf("✔ 容器 %s 已安装并启动!\n", name)
 	return nil
 }

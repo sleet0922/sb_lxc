@@ -19,6 +19,9 @@ func main() {
 	client := NewIncusClient()
 	client.EnsureMirrorRemote()
 
+	// 每次启动程序都自动刷新宿主机侧 macvlan shim 与当前运行容器的 /32 路由。
+	warnAutoHostMacvlan(AutoConfigureHostMacvlan(client))
+
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(0)
