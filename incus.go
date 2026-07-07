@@ -29,6 +29,11 @@ type IncusClient struct{}
 // NewIncusClient 创建客户端实例。
 func NewIncusClient() *IncusClient { return &IncusClient{} }
 
+const (
+	defaultNICName       = "eth0"
+	defaultMacvlanParent = "ens18"
+)
+
 // ──────────────────── 数据结构（对应 incus list --format json） ────────────────────
 
 // Container 对应 incus list --format json 的单个元素。
@@ -105,26 +110,36 @@ func (c *IncusClient) EnsureMirrorRemote() {
 // ──────────────────── 生命周期 ────────────────────
 
 func (c *IncusClient) Start(name string) error {
-	// 启动前重新生成 eth0 的 MAC 地址，避免从同一来源复制的容器 MAC 冲突
-	_ = c.regenerateMAC(name)
+	// 启动前重新配置 eth0，确保使用 macvlan 直连物理网卡且 MAC 不冲突。
+	if err := c.configureMacvlanNIC(name); err != nil {
+		return fmt.Errorf("配置 %s macvlan 网络失败: %w", defaultNICName, err)
+	}
 	return c.run("start", name)
 }
 
-// regenerateMAC 为容器 eth0 设备生成新的随机 MAC 地址。
-// eth0 可能定义在 profile 中，需先 add 覆盖到容器级别，再 set 更新 MAC。
-func (c *IncusClient) regenerateMAC(name string) error {
+// configureMacvlanNIC 配置容器 eth0 使用 macvlan 直连物理网卡。
+// 默认 profile 里可能继承了 incusbr0，这里用容器级 eth0 覆盖它，避免 NAT。
+func (c *IncusClient) configureMacvlanNIC(name string) error {
 	mac, err := randomMAC()
 	if err != nil {
 		return err
 	}
-	// 先尝试 set（若容器级别已有 eth0 覆盖）
-	if exec.Command("incus", "config", "device", "set", name, "eth0", "hwaddr="+mac).Run() == nil {
+	args := []string{
+		"name=" + defaultNICName,
+		"nictype=macvlan",
+		"parent=" + defaultMacvlanParent,
+		"hwaddr=" + mac,
+	}
+	// 先移除容器级 eth0（若存在），再优先覆盖 profile 继承的 eth0。
+	// 若没有继承设备，override 会失败，随后 add 会创建新的容器级 eth0。
+	_ = exec.Command("incus", "config", "device", "remove", name, defaultNICName).Run()
+	if exec.Command("incus", append([]string{"config", "device", "override", name, defaultNICName}, args...)...).Run() == nil {
+		_ = exec.Command("incus", "config", "device", "unset", name, defaultNICName, "network").Run()
 		return nil
 	}
-	// 否则用 add 覆盖 profile 中的 eth0 设备
-	return exec.Command("incus", "config", "device", "add", name, "eth0", "nic",
-		"name=eth0", "network=incusbr0", "hwaddr="+mac).Run()
+	return exec.Command("incus", append([]string{"config", "device", "add", name, defaultNICName, "nic"}, args...)...).Run()
 }
+
 // randomMAC 生成一个本地管理的随机 MAC 地址。
 func randomMAC() (string, error) {
 	buf := make([]byte, 6)
@@ -136,7 +151,7 @@ func randomMAC() (string, error) {
 	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]), nil
 }
 func (c *IncusClient) Stop(name string) error   { return c.run("stop", name) }
-func (c *IncusClient) Delete(name string) error  { return c.run("delete", name, "--force") }
+func (c *IncusClient) Delete(name string) error { return c.run("delete", name, "--force") }
 
 // Exec 进入容器，优先用 bash（支持方向键/Tab补全/历史记录），无则回退 sh。
 // 先静默探测可用 shell，避免回退时打印迷惑的 "Command not found" 错误。
@@ -162,9 +177,15 @@ func (c *IncusClient) Exec(name string) error {
 	return nil
 }
 
-// Launch 从镜像源启动新容器。
+// Launch 从镜像源创建新容器，并配置 macvlan 直连 ens18 后启动。
 func (c *IncusClient) Launch(imageRef, name string) error {
-	return c.run("launch", imageRef, name)
+	if err := c.run("init", imageRef, name); err != nil {
+		return err
+	}
+	if err := c.configureMacvlanNIC(name); err != nil {
+		return fmt.Errorf("配置 %s macvlan 网络失败: %w", defaultNICName, err)
+	}
+	return c.run("start", name)
 }
 
 // ──────────────────── 查询 ────────────────────
@@ -244,6 +265,14 @@ func (c *IncusClient) Export(name, path string) error {
 // Import 从 tar.gz 文件导入容器。
 func (c *IncusClient) Import(path, name string) error {
 	return c.run("import", path, name)
+}
+
+// ConfigureDefaultNetwork 为已存在容器应用默认 macvlan 网络配置。
+func (c *IncusClient) ConfigureDefaultNetwork(name string) error {
+	if err := c.configureMacvlanNIC(name); err != nil {
+		return fmt.Errorf("配置 %s macvlan 网络失败: %w", defaultNICName, err)
+	}
+	return nil
 }
 
 // ──────────────────── Container 便捷方法 ────────────────────
@@ -341,11 +370,11 @@ func shortAddr(addr string) string {
 
 // Image 对应 incus image list --format json 的单个元素。
 type Image struct {
-	Architecture string              `json:"architecture"`
-	Type         string              `json:"type"`
-	Aliases      []ImageAlias        `json:"aliases"`
-	Properties   map[string]string  `json:"properties"`
-	Size         int64               `json:"size"`
+	Architecture string            `json:"architecture"`
+	Type         string            `json:"type"`
+	Aliases      []ImageAlias      `json:"aliases"`
+	Properties   map[string]string `json:"properties"`
+	Size         int64             `json:"size"`
 }
 
 // ImageAlias 镜像别名。
@@ -361,7 +390,7 @@ type ImageVersion struct {
 
 // DistroGroup 发行版分组：发行版名 → 该发行版下所有可选版本。
 type DistroGroup struct {
-	Distro   string        // 发行版名，如 "Debian"
+	Distro   string // 发行版名，如 "Debian"
 	Versions []ImageVersion
 }
 

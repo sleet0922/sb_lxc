@@ -110,15 +110,62 @@ func CmdImport(args []string) error {
 	}
 	fmt.Printf("导入 %s ...\n", path)
 	client := NewIncusClient()
+	var before map[string]bool
+	if name == "" {
+		before = containerNameSet(client)
+	}
 	if name != "" {
 		if err := client.Import(path, name); err != nil {
+			return err
+		}
+		if err := client.ConfigureDefaultNetwork(name); err != nil {
 			return err
 		}
 	} else {
 		if err := client.run("import", path); err != nil {
 			return err
 		}
+		importedName := findImportedContainerName(client, before)
+		if importedName == "" {
+			return fmt.Errorf("导入完成，但无法确认新容器名，未配置 macvlan 网络")
+		}
+		if err := client.ConfigureDefaultNetwork(importedName); err != nil {
+			return err
+		}
 	}
 	fmt.Printf("✔ 导入完成\n")
 	return nil
+}
+
+func containerNameSet(client *IncusClient) map[string]bool {
+	cs, err := client.ListContainers()
+	if err != nil {
+		return nil
+	}
+	names := make(map[string]bool, len(cs))
+	for _, ct := range cs {
+		names[ct.Name] = true
+	}
+	return names
+}
+
+func findImportedContainerName(client *IncusClient, before map[string]bool) string {
+	if before == nil {
+		return ""
+	}
+	cs, err := client.ListContainers()
+	if err != nil {
+		return ""
+	}
+	importedName := ""
+	for _, ct := range cs {
+		if before[ct.Name] {
+			continue
+		}
+		if importedName != "" {
+			return ""
+		}
+		importedName = ct.Name
+	}
+	return importedName
 }
