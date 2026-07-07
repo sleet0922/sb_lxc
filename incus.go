@@ -31,8 +31,82 @@ func NewIncusClient() *IncusClient { return &IncusClient{} }
 
 const (
 	defaultNICName       = "eth0"
-	defaultMacvlanParent = "ens18"
+	defaultMacvlanParent = "ens18" // 自动识别失败时的兼容回退值。
+	macvlanParentEnv     = "SB_LXC_MACVLAN_PARENT"
 )
+
+// detectMacvlanParent 自动识别用于 macvlan 的父网卡。
+// 优先级：
+//  1. SB_LXC_MACVLAN_PARENT 环境变量手动指定；
+//  2. IPv4 默认路由里的 dev；
+//  3. 兼容旧环境，回退到 ens18。
+func detectMacvlanParent() (string, error) {
+	if parent := strings.TrimSpace(os.Getenv(macvlanParentEnv)); parent != "" {
+		if !linkExists(parent) {
+			return "", fmt.Errorf("%s=%q 指定的网卡不存在或不可用", macvlanParentEnv, parent)
+		}
+		return parent, nil
+	}
+
+	if parent, err := defaultIPv4RouteParent(); err == nil && parent != "" {
+		if !linkExists(parent) {
+			return "", fmt.Errorf("默认出口网卡 %q 不存在或不可用", parent)
+		}
+		return parent, nil
+	}
+
+	if linkExists(defaultMacvlanParent) {
+		return defaultMacvlanParent, nil
+	}
+
+	return "", fmt.Errorf("无法自动识别默认出口网卡；请设置 %s=网卡名", macvlanParentEnv)
+}
+
+func defaultIPv4RouteParent() (string, error) {
+	out, err := exec.Command("ip", "-4", "route", "show", "default").Output()
+	if err == nil {
+		if dev := firstRouteDev(string(out)); dev != "" {
+			return dev, nil
+		}
+	}
+	showErr := err
+
+	out, err = exec.Command("ip", "-4", "route", "get", "1.1.1.1").Output()
+	if err == nil {
+		if dev := firstRouteDev(string(out)); dev != "" {
+			return dev, nil
+		}
+	}
+
+	if showErr != nil {
+		return "", fmt.Errorf("读取默认 IPv4 路由失败: %w", showErr)
+	}
+	if err != nil {
+		return "", fmt.Errorf("探测默认 IPv4 出口失败: %w", err)
+	}
+	return "", fmt.Errorf("默认 IPv4 路由中没有 dev 字段")
+}
+
+func firstRouteDev(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		for i, field := range fields {
+			if field != "dev" || i+1 >= len(fields) {
+				continue
+			}
+			dev := strings.TrimSpace(fields[i+1])
+			if dev == "" || dev == "lo" || dev == defaultHostMacvlanName {
+				continue
+			}
+			return dev
+		}
+	}
+	return ""
+}
+
+func linkExists(name string) bool {
+	return exec.Command("ip", "link", "show", name).Run() == nil
+}
 
 // ──────────────────── 数据结构（对应 incus list --format json） ────────────────────
 
@@ -117,10 +191,15 @@ func (c *IncusClient) Start(name string) error {
 	return c.run("start", name)
 }
 
-// configureMacvlanNIC 配置容器 eth0 使用 macvlan 直连物理网卡。
+// configureMacvlanNIC 配置容器 eth0 使用 macvlan 直连默认出口网卡。
 // 默认 profile 里可能继承了 incusbr0，这里用容器级 eth0 覆盖它，避免 NAT。
-// 注意：这里只配置容器虚拟网卡，不会修改宿主机物理网卡 ens18 的 MAC。
+// 注意：这里只配置容器虚拟网卡，不会修改宿主机物理网卡的 MAC。
 func (c *IncusClient) configureMacvlanNIC(name string) error {
+	parent, err := detectMacvlanParent()
+	if err != nil {
+		return err
+	}
+
 	mac, err := c.containerNICMAC(name, defaultNICName)
 	if err != nil {
 		return err
@@ -135,7 +214,7 @@ func (c *IncusClient) configureMacvlanNIC(name string) error {
 	args := []string{
 		"name=" + defaultNICName,
 		"nictype=macvlan",
-		"parent=" + defaultMacvlanParent,
+		"parent=" + parent,
 		"hwaddr=" + mac,
 	}
 	// 先移除容器级 eth0（若存在），再优先覆盖 profile 继承的 eth0。
@@ -219,7 +298,7 @@ func (c *IncusClient) Exec(name string) error {
 	return nil
 }
 
-// Launch 从镜像源创建新容器，并配置 macvlan 直连 ens18 后启动。
+// Launch 从镜像源创建新容器，并配置 macvlan 直连默认出口网卡后启动。
 func (c *IncusClient) Launch(imageRef, name string) error {
 	if err := c.run("init", imageRef, name); err != nil {
 		return err

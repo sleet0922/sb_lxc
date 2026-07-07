@@ -52,7 +52,11 @@ func ensureHostMacvlanRoutes(targets []string) error {
 		return err
 	}
 
-	parent := defaultMacvlanParent
+	parent, err := detectMacvlanParent()
+	if err != nil {
+		return err
+	}
+
 	normalizedTargets := make([]string, 0, len(targets))
 	reservedIPs := make([]net.IP, 0, len(targets))
 	for _, target := range targets {
@@ -271,7 +275,11 @@ func ensureHostMacvlan(parent, ifname string) error {
 	}
 
 	if err := exec.Command("ip", "link", "show", ifname).Run(); err == nil {
-		return nil
+		if existingParent, ok := linkParent(ifname); ok && existingParent != parent {
+			_ = exec.Command("ip", "link", "del", ifname).Run()
+		} else {
+			return nil
+		}
 	}
 
 	cmd := exec.Command("ip", "link", "add", ifname, "link", parent, "type", "macvlan", "mode", "bridge")
@@ -281,11 +289,29 @@ func ensureHostMacvlan(parent, ifname string) error {
 	return nil
 }
 
-// configureHostMacvlanIsolation 避免宿主机物理网卡 ens18 和 macvlan shim 在同一二层
+// linkParent 返回类似 "sb-lxc-mv@ens18" 中的父接口名 "ens18"。
+func linkParent(ifname string) (string, bool) {
+	out, err := exec.Command("ip", "-o", "link", "show", ifname).Output()
+	if err != nil {
+		return "", false
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) < 2 {
+		return "", false
+	}
+	name := strings.TrimSuffix(fields[1], ":")
+	idx := strings.LastIndex(name, "@")
+	if idx < 0 || idx+1 >= len(name) {
+		return "", false
+	}
+	return name[idx+1:], true
+}
+
+// configureHostMacvlanIsolation 避免宿主机物理网卡和 macvlan shim 在同一二层
 // 网络内互相替对方的 IPv4 地址响应 ARP。否则路由器可能会看到同一个宿主机 IP
-// 同时对应 ens18 的物理 MAC 和 sb-lxc-mv 的虚拟 MAC（ARP flux）。
+// 同时对应物理网卡 MAC 和 sb-lxc-mv 的虚拟 MAC（ARP flux）。
 //
-// 该函数只调整运行时 sysctl，不会修改 ens18 的物理 MAC，也不会修改 ens18 的 IPv4。
+// 该函数只调整运行时 sysctl，不会修改物理网卡 MAC，也不会修改物理网卡 IPv4。
 func configureHostMacvlanIsolation(parent, ifname string) error {
 	settings := []struct {
 		path  string
