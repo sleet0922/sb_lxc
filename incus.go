@@ -385,24 +385,7 @@ func (c *IncusClient) UnsetDomain(name string) error {
 	return c.run("config", "unset", name, "user.sb_lxc.domain")
 }
 
-// AddProxyDevice 添加端口映射代理设备。
-func (c *IncusClient) AddProxyDevice(name, device, listen, connect string) error {
-	return c.run("config", "device", "add", name, device, "proxy",
-		"listen="+listen, "connect="+connect)
-}
 
-// AddDiskDevice 添加磁盘设备，把宿主机目录挂载到容器（双向共享）。
-// shift=true 启用 idmapped mount，使非特权容器的 uid/gid 自动映射，
-// 容器内 root 可正常读写宿主机文件，反之亦然。
-func (c *IncusClient) AddDiskDevice(name, device, source, path string) error {
-	return c.run("config", "device", "add", name, device, "disk",
-		"source="+source, "path="+path, "shift=true")
-}
-
-// RemoveDevice 移除设备。
-func (c *IncusClient) RemoveDevice(name, device string) error {
-	return c.run("config", "device", "remove", name, device)
-}
 
 // Export 导出容器为 tar.gz 文件。
 func (c *IncusClient) Export(name, path string) error {
@@ -424,20 +407,7 @@ func (c *IncusClient) ConfigureDefaultNetwork(name string) error {
 
 // ──────────────────── Container 便捷方法 ────────────────────
 
-// ProxyDevices 从展开设备中提取所有 proxy 设备。
-func (ct *Container) ProxyDevices() map[string]map[string]string {
-	result := map[string]map[string]string{}
-	devs := ct.ExpandedDevices
-	if devs == nil {
-		devs = ct.Devices
-	}
-	for k, v := range devs {
-		if v["type"] == "proxy" {
-			result[k] = v
-		}
-	}
-	return result
-}
+
 
 func (ct *Container) NICMAC(nic string) string {
 	for _, devs := range []map[string]map[string]string{ct.Devices, ct.ExpandedDevices} {
@@ -472,24 +442,7 @@ func (ct *Container) UsesMacvlanNIC(nic string) bool {
 	return dev["type"] == "nic" && dev["nictype"] == "macvlan"
 }
 
-// MountDevices 从展开设备中提取所有挂载用磁盘设备（排除根盘）。
-func (ct *Container) MountDevices() map[string]map[string]string {
-	result := map[string]map[string]string{}
-	devs := ct.ExpandedDevices
-	if devs == nil {
-		devs = ct.Devices
-	}
-	for k, v := range devs {
-		if v["type"] != "disk" {
-			continue
-		}
-		if v["path"] == "/" || v["source"] == "" {
-			continue
-		}
-		result[k] = v
-	}
-	return result
-}
+
 
 // IPv4 返回首个全局 IPv4 地址。
 func (ct *Container) IPv4() string {
@@ -537,14 +490,7 @@ func (ct *Container) Domain() string {
 	return ct.Config["user.sb_lxc.domain"]
 }
 
-// shortAddr 将 tcp:0.0.0.0:8080 简化为 8080。
-func shortAddr(addr string) string {
-	parts := strings.Split(addr, ":")
-	if len(parts) == 3 {
-		return parts[2]
-	}
-	return addr
-}
+
 
 // ──────────────────── 镜像查询 ────────────────────
 

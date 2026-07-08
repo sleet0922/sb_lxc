@@ -4,11 +4,10 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 )
 
-// CmdSet 容器设置：交互式菜单选择端口映射 / 取消端口映射 / 开关开机自启。
+// CmdSet 容器设置：交互式菜单选择域名映射 / 开关开机自启。
 func CmdSet(name string) error {
 	client := NewIncusClient()
 	ct, err := client.GetContainer(name)
@@ -17,12 +16,8 @@ func CmdSet(name string) error {
 	}
 
 	options := []string{
-		"端口映射",
-		"取消端口映射",
 		"域名映射",
 		"取消域名映射",
-		"挂载文件夹",
-		"取消挂载",
 		"开机自启动",
 		"关闭开机自启动",
 	}
@@ -36,23 +31,15 @@ func CmdSet(name string) error {
 
 	switch choice {
 	case 0:
-		return addPortMapping(client, name)
-	case 1:
-		return removePortMapping(client, ct)
-	case 2:
 		return setDomain(client, ct)
-	case 3:
+	case 1:
 		return removeDomain(client, ct)
-	case 4:
-		return addMount(client, ct)
-	case 5:
-		return removeMount(client, ct)
-	case 6:
+	case 2:
 		if err := client.SetBootAutostart(name, true); err != nil {
 			return err
 		}
 		fmt.Printf("✔ 容器 %s 已开启开机自启动\n", name)
-	case 7:
+	case 3:
 		if err := client.SetBootAutostart(name, false); err != nil {
 			return err
 		}
@@ -69,60 +56,6 @@ func orNA(s string) string {
 	return s
 }
 
-// addPortMapping 交互式添加端口映射，全监听 0.0.0.0。
-func addPortMapping(client *IncusClient, name string) error {
-	r := bufio.NewReader(os.Stdin)
-	hostPort := prompt(r, "宿主机端口: ")
-	if hostPort == "" {
-		return fmt.Errorf("宿主机端口不能为空")
-	}
-	containerPort := prompt(r, "容器端口: ")
-	if containerPort == "" {
-		return fmt.Errorf("容器端口不能为空")
-	}
-
-	device := "port" + hostPort
-	listen := fmt.Sprintf("tcp:0.0.0.0:%s", hostPort)
-	connect := fmt.Sprintf("tcp:0.0.0.0:%s", containerPort)
-
-	if err := client.AddProxyDevice(name, device, listen, connect); err != nil {
-		return err
-	}
-	fmt.Printf("✔ 端口映射已添加: 0.0.0.0:%s -> 0.0.0.0:%s (设备 %s)\n", hostPort, containerPort, device)
-	return nil
-}
-
-// removePortMapping 列出已有端口映射供选择移除。
-func removePortMapping(client *IncusClient, ct *Container) error {
-	devs := ct.ProxyDevices()
-	if len(devs) == 0 {
-		fmt.Println("该容器没有端口映射设备。")
-		return nil
-	}
-
-	names := make([]string, 0, len(devs))
-	for k := range devs {
-		names = append(names, k)
-	}
-	sort.Strings(names)
-
-	labels := make([]string, len(names))
-	for i, n := range names {
-		d := devs[n]
-		labels[i] = fmt.Sprintf("%s  (%s -> %s)", n, shortAddr(d["listen"]), shortAddr(d["connect"]))
-	}
-
-	choice := selectMenu(labels, "选择要移除的端口映射 (↑↓ 选择, Enter 确认, q 退出)")
-	if choice < 0 {
-		return nil
-	}
-	target := names[choice]
-	if err := client.RemoveDevice(ct.Name, target); err != nil {
-		return err
-	}
-	fmt.Printf("✔ 端口映射 %s 已移除\n", target)
-	return nil
-}
 
 // setDomain 设置域名映射，若容器已运行则立即更新 /etc/hosts。
 func setDomain(client *IncusClient, ct *Container) error {

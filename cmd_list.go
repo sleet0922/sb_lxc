@@ -20,30 +20,17 @@ func CmdList() error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tSTATUS\tIPV4\tAUTOSTART\tPORTS")
+	fmt.Fprintln(w, "NAME\tSTATUS\tIPV4\tAUTOSTART")
 	for i := range cs {
 		c := &cs[i]
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
 			c.Name,
 			strings.ToLower(c.Status),
 			c.IPv4(),
 			autostartBadge(c.Autostart()),
-			formatPorts(c.ProxyDevices()),
 		)
 	}
 	return w.Flush()
-}
-
-// formatPorts 把 proxy 设备格式化为 8080->80 形式。
-func formatPorts(devs map[string]map[string]string) string {
-	if len(devs) == 0 {
-		return "-"
-	}
-	var parts []string
-	for _, d := range devs {
-		parts = append(parts, shortAddr(d["listen"])+"->"+shortAddr(d["connect"]))
-	}
-	return strings.Join(parts, ", ")
 }
 
 func autostartBadge(v string) string {
