@@ -18,6 +18,7 @@ func main() {
 	// 每次启动都先确保只保留清华镜像源（移除官方 images 源与旧 mirror-images）
 	client := NewIncusClient()
 	client.EnsureMirrorRemote()
+	warnAutoHostMacvlan(client.EnsureDefaultMacvlanProfile())
 
 	// 每次启动程序都自动刷新宿主机侧 macvlan shim 与当前运行容器的 /32 路由。
 	warnAutoHostMacvlan(AutoConfigureHostMacvlan(client))

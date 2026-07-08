@@ -168,6 +168,15 @@ func (c *IncusClient) capture(args ...string) ([]byte, error) {
 	return out, nil
 }
 
+func (c *IncusClient) execQuiet(name string, args ...string) error {
+	full := append([]string{"exec", name, "--"}, args...)
+	cmd := exec.Command("incus", full...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("incus exec %s 失败: %w\n%s", name, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // EnsureMirrorRemote 确保系统只保留清华镜像源：移除官方 images 源与可能指向
 // 其他地址的旧 mirror-images，再添加指向清华源的 mirror-images。
 // local 为本地 daemon，不在处理范围内。所有删除/添加错误均忽略（幂等）。
@@ -179,6 +188,23 @@ func (c *IncusClient) EnsureMirrorRemote() {
 	// 添加清华镜像源
 	_ = exec.Command("incus", "remote", "add", MirrorRemote, MirrorURL,
 		"--protocol=simplestreams", "--public").Run()
+}
+
+// EnsureDefaultMacvlanProfile 确保新建容器默认使用 macvlan 直连物理网卡。
+// 这一步只修改 Incus default profile 的 eth0，不修改宿主机物理网卡。
+func (c *IncusClient) EnsureDefaultMacvlanProfile() error {
+	parent, err := detectMacvlanParent()
+	if err != nil {
+		return err
+	}
+
+	_ = exec.Command("incus", "profile", "device", "remove", "default", defaultNICName).Run()
+	cmd := exec.Command("incus", "profile", "device", "add", "default", defaultNICName, "nic",
+		"nictype=macvlan", "parent="+parent)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("配置 default profile 的 %s macvlan 失败: %w\n%s", defaultNICName, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // ──────────────────── 生命周期 ────────────────────
@@ -411,6 +437,39 @@ func (ct *Container) ProxyDevices() map[string]map[string]string {
 		}
 	}
 	return result
+}
+
+func (ct *Container) NICMAC(nic string) string {
+	for _, devs := range []map[string]map[string]string{ct.Devices, ct.ExpandedDevices} {
+		if dev := devs[nic]; dev != nil {
+			if mac := strings.TrimSpace(dev["hwaddr"]); mac != "" {
+				return mac
+			}
+		}
+	}
+	if ct.Config != nil {
+		if mac := strings.TrimSpace(ct.Config["volatile."+nic+".hwaddr"]); mac != "" {
+			return mac
+		}
+	}
+	if ct.State != nil && ct.State.Network != nil {
+		if state, ok := ct.State.Network[nic]; ok {
+			return strings.TrimSpace(state.HwAddr)
+		}
+	}
+	return ""
+}
+
+func (ct *Container) UsesMacvlanNIC(nic string) bool {
+	devs := ct.ExpandedDevices
+	if devs == nil {
+		devs = ct.Devices
+	}
+	dev := devs[nic]
+	if dev == nil {
+		return false
+	}
+	return dev["type"] == "nic" && dev["nictype"] == "macvlan"
 }
 
 // MountDevices 从展开设备中提取所有挂载用磁盘设备（排除根盘）。

@@ -22,11 +22,8 @@ const (
 // 路由器/局域网其他机器，但宿主机与容器之间不会经由物理网卡“折返”。解决办法是在
 // 宿主机上也创建一个 macvlan 子接口，并把容器 IP 路由到该子接口。
 func AutoConfigureHostMacvlan(client *IncusClient) error {
-	targets := runningContainerIPv4Routes(client)
-	if len(targets) == 0 {
-		return nil
-	}
-	return ensureHostMacvlanRoutes(targets)
+	targets := runningMacvlanContainers(client)
+	return ensureHostMacvlanConnectivity(client, targets)
 }
 
 // AutoConfigureHostMacvlanForIP 为单个容器 IPv4 自动补齐宿主机侧 macvlan 路由。
@@ -45,9 +42,28 @@ func warnAutoHostMacvlan(err error) {
 }
 
 func ensureHostMacvlanRoutes(targets []string) error {
-	if len(targets) == 0 {
-		return nil
+	routeTargets := make([]macvlanRouteTarget, 0, len(targets))
+	for _, target := range targets {
+		normalized, err := normalizeRouteTarget(target)
+		if err != nil {
+			return fmt.Errorf("路由目标 %q 无效: %w", target, err)
+		}
+		routeTargets = append(routeTargets, macvlanRouteTarget{
+			IP:    routeTargetIPv4(normalized),
+			Route: normalized,
+		})
 	}
+	return ensureHostMacvlanConnectivity(nil, routeTargets)
+}
+
+type macvlanRouteTarget struct {
+	Name  string
+	IP    net.IP
+	MAC   string
+	Route string
+}
+
+func ensureHostMacvlanConnectivity(client *IncusClient, targets []macvlanRouteTarget) error {
 	if err := ensureCommand("ip"); err != nil {
 		return err
 	}
@@ -57,16 +73,24 @@ func ensureHostMacvlanRoutes(targets []string) error {
 		return err
 	}
 
-	normalizedTargets := make([]string, 0, len(targets))
 	reservedIPs := make([]net.IP, 0, len(targets))
-	for _, target := range targets {
-		normalized, err := normalizeRouteTarget(target)
-		if err != nil {
-			return fmt.Errorf("路由目标 %q 无效: %w", target, err)
+	for i := range targets {
+		if targets[i].Route == "" {
+			if targets[i].IP == nil || targets[i].IP.To4() == nil {
+				return fmt.Errorf("路由目标 %q 没有可用 IPv4", targets[i].Name)
+			}
+			targets[i].Route = targets[i].IP.String() + "/32"
 		}
-		normalizedTargets = append(normalizedTargets, normalized)
-		if ip := routeTargetIPv4(normalized); ip != nil {
-			reservedIPs = append(reservedIPs, ip)
+		normalized, err := normalizeRouteTarget(targets[i].Route)
+		if err != nil {
+			return fmt.Errorf("路由目标 %q 无效: %w", targets[i].Route, err)
+		}
+		targets[i].Route = normalized
+		if targets[i].IP == nil {
+			targets[i].IP = routeTargetIPv4(normalized)
+		}
+		if targets[i].IP != nil {
+			reservedIPs = append(reservedIPs, targets[i].IP)
 		}
 	}
 
@@ -93,9 +117,25 @@ func ensureHostMacvlanRoutes(targets []string) error {
 		return err
 	}
 
-	for _, target := range normalizedTargets {
-		if err := replaceRoute(target, defaultHostMacvlanName, shimIP.String()); err != nil {
+	hostIP, _, _ := firstGlobalIPv4CIDR(parent)
+	hostIPStr := ""
+	if hostIP != nil {
+		hostIPStr = hostIP.String()
+	}
+	shimMAC, _ := linkMAC(defaultHostMacvlanName)
+
+	for _, target := range targets {
+		if err := replaceRoute(target.Route, defaultHostMacvlanName, shimIP.String()); err != nil {
 			return err
+		}
+		if target.IP != nil && strings.TrimSpace(target.MAC) != "" {
+			if err := replaceStaticARP(target.IP.String(), target.MAC, defaultHostMacvlanName); err != nil {
+				return err
+			}
+		}
+		if client != nil && target.Name != "" && shimMAC != "" {
+			_ = replaceContainerStaticARP(client, target.Name, hostIPStr, shimMAC, defaultNICName)
+			_ = replaceContainerStaticARP(client, target.Name, shimIP.String(), shimMAC, defaultNICName)
 		}
 	}
 	return nil
@@ -366,6 +406,14 @@ func linkUp(ifname string) error {
 	return nil
 }
 
+func linkMAC(ifname string) (string, error) {
+	data, err := os.ReadFile("/sys/class/net/" + ifname + "/address")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
 func replaceRoute(target, ifname, src string) error {
 	args := []string{"route", "replace", target, "dev", ifname}
 	if src != "" {
@@ -378,14 +426,32 @@ func replaceRoute(target, ifname, src string) error {
 	return nil
 }
 
-func runningContainerIPv4Routes(client *IncusClient) []string {
+func replaceStaticARP(ip, mac, ifname string) error {
+	if strings.TrimSpace(ip) == "" || strings.TrimSpace(mac) == "" {
+		return nil
+	}
+	cmd := exec.Command("ip", "neigh", "replace", ip, "lladdr", mac, "nud", "permanent", "dev", ifname)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("配置静态 ARP 失败: %w\n%s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func replaceContainerStaticARP(client *IncusClient, name, ip, mac, nic string) error {
+	if strings.TrimSpace(ip) == "" || strings.TrimSpace(mac) == "" {
+		return nil
+	}
+	return client.execQuiet(name, "ip", "neigh", "replace", ip, "lladdr", mac, "nud", "permanent", "dev", nic)
+}
+
+func runningMacvlanContainers(client *IncusClient) []macvlanRouteTarget {
 	cs, err := client.ListContainers()
 	if err != nil {
 		return nil
 	}
 
 	seen := map[string]bool{}
-	routes := []string{}
+	targets := []macvlanRouteTarget{}
 	for _, ct := range cs {
 		if !strings.EqualFold(ct.Status, "Running") {
 			continue
@@ -394,10 +460,18 @@ func runningContainerIPv4Routes(client *IncusClient) []string {
 		if ip == "" || seen[ip] {
 			continue
 		}
+		if !ct.UsesMacvlanNIC(defaultNICName) {
+			continue
+		}
 		seen[ip] = true
-		routes = append(routes, ip+"/32")
+		targets = append(targets, macvlanRouteTarget{
+			Name:  ct.Name,
+			IP:    net.ParseIP(ip).To4(),
+			MAC:   ct.NICMAC(defaultNICName),
+			Route: ip + "/32",
+		})
 	}
-	return routes
+	return targets
 }
 
 func validateCIDR(cidr string) error {
