@@ -441,7 +441,8 @@ func replaceContainerStaticARP(client *IncusClient, name, ip, mac, nic string) e
 	if strings.TrimSpace(ip) == "" || strings.TrimSpace(mac) == "" {
 		return nil
 	}
-	return client.execQuiet(name, "ip", "neigh", "replace", ip, "lladdr", mac, "nud", "permanent", "dev", nic)
+	_, err := client.execQuiet(name, "ip", "neigh", "replace", ip, "lladdr", mac, "nud", "permanent", "dev", nic)
+	return err
 }
 
 func runningMacvlanContainers(client *IncusClient) []macvlanRouteTarget {

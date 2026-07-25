@@ -1,16 +1,39 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
-	"os"
 	"strings"
 )
 
 // CmdInstall 两级菜单：先选发行版，再选具体版本，最后安装。
-func CmdInstall() error {
-	fmt.Println("正在从镜像源获取可用发行版列表 ...")
+// 若传入参数：sb_lxc install [镜像名/引用] [容器名] 则跳过菜单直接安装。
+func CmdInstall(args []string) error {
 	client := NewIncusClient()
+
+	if len(args) >= 1 {
+		imageRef := args[0]
+		if !strings.Contains(imageRef, ":") {
+			imageRef = MirrorRemote + ":" + imageRef
+		}
+		name := ""
+		if len(args) >= 2 {
+			name = args[1]
+		} else {
+			name = defaultNameFromImage(args[0])
+		}
+		fmt.Printf("正在安装 %s (名称: %s) ...\n", imageRef, name)
+		if err := client.Launch(imageRef, name); err != nil {
+			return err
+		}
+		ip := waitForIP(client, name, 15)
+		if ip != "" {
+			warnAutoHostMacvlan(AutoConfigureHostMacvlan(client))
+		}
+		fmt.Printf("✔ 容器 %s 已安装并启动!\n", name)
+		return nil
+	}
+
+	fmt.Println("正在从镜像源获取可用发行版列表 ...")
 	groups, err := client.ListImages()
 	if err != nil {
 		return err
@@ -42,9 +65,8 @@ func CmdInstall() error {
 	version := group.Versions[vChoice]
 
 	// 容器名
-	r := bufio.NewReader(os.Stdin)
 	defaultName := defaultNameFromImage(version.Image)
-	name := prompt(r, fmt.Sprintf("容器名称 (回车默认 %s): ", defaultName))
+	name := prompt(fmt.Sprintf("容器名称 (回车默认 %s): ", defaultName))
 	if name == "" {
 		name = defaultName
 	}

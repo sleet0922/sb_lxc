@@ -1,17 +1,93 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
-	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
+
+	incus "github.com/lxc/incus/v6/client"
+	"github.com/lxc/incus/v6/shared/api"
+	"golang.org/x/term"
 )
 
-// archName 将 Go 架构名映射为 incus 镜像架构名。
+// IncusClient is a thin application-specific wrapper around the official
+// Incus REST client. It connects to the local Unix socket by default.
+type IncusClient struct {
+	server    incus.InstanceServer
+	initErr   error
+	imageServ incus.ImageServer
+	imageErr  error
+}
+
+// NewIncusClient connects to the local daemon unless SB_LXC_INCUS_URL is set.
+// The URL form is useful when the tool itself is not running on the daemon.
+func NewIncusClient() *IncusClient {
+	c := &IncusClient{}
+	args := connectionArgsFromEnv()
+	if uri := strings.TrimSpace(os.Getenv("SB_LXC_INCUS_URL")); uri != "" {
+		c.server, c.initErr = incus.ConnectIncus(uri, args)
+	} else {
+		c.server, c.initErr = incus.ConnectIncusUnix("", args)
+	}
+	return c
+}
+
+func connectionArgsFromEnv() *incus.ConnectionArgs {
+	args := &incus.ConnectionArgs{SkipGetEvents: true}
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("SB_LXC_INCUS_INSECURE")), "true") {
+		args.InsecureSkipVerify = true
+	}
+	args.TLSServerCert = readOptionalFileEnv("SB_LXC_INCUS_SERVER_CERT")
+	args.TLSClientCert = readOptionalFileEnv("SB_LXC_INCUS_CLIENT_CERT")
+	args.TLSClientKey = readOptionalFileEnv("SB_LXC_INCUS_CLIENT_KEY")
+	args.TLSCA = readOptionalFileEnv("SB_LXC_INCUS_CA")
+	return args
+}
+
+func readOptionalFileEnv(name string) string {
+	path := strings.TrimSpace(os.Getenv(name))
+	if path == "" {
+		return ""
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+func (c *IncusClient) ready() error {
+	if c == nil {
+		return fmt.Errorf("Incus 客户端为空")
+	}
+	if c.initErr != nil {
+		return fmt.Errorf("连接 Incus REST API 失败: %w", c.initErr)
+	}
+	return nil
+}
+
+func (c *IncusClient) imageServer() (incus.ImageServer, error) {
+	if err := c.ready(); err != nil {
+		return nil, err
+	}
+	if c.imageServ != nil || c.imageErr != nil {
+		return c.imageServ, c.imageErr
+	}
+	c.imageServ, c.imageErr = incus.ConnectSimpleStreams(MirrorURL, nil)
+	if c.imageErr != nil {
+		return nil, fmt.Errorf("连接镜像 SimpleStreams 服务失败: %w", c.imageErr)
+	}
+	return c.imageServ, nil
+}
+
 func archName() string {
 	switch runtime.GOARCH {
 	case "amd64":
@@ -23,23 +99,12 @@ func archName() string {
 	}
 }
 
-// IncusClient 封装对 incus 命令的调用与输出解析。
-type IncusClient struct{}
-
-// NewIncusClient 创建客户端实例。
-func NewIncusClient() *IncusClient { return &IncusClient{} }
-
 const (
 	defaultNICName       = "eth0"
-	defaultMacvlanParent = "ens18" // 自动识别失败时的兼容回退值。
+	defaultMacvlanParent = "ens18"
 	macvlanParentEnv     = "SB_LXC_MACVLAN_PARENT"
 )
 
-// detectMacvlanParent 自动识别用于 macvlan 的父网卡。
-// 优先级：
-//  1. SB_LXC_MACVLAN_PARENT 环境变量手动指定；
-//  2. IPv4 默认路由里的 dev；
-//  3. 兼容旧环境，回退到 ens18。
 func detectMacvlanParent() (string, error) {
 	if parent := strings.TrimSpace(os.Getenv(macvlanParentEnv)); parent != "" {
 		if !linkExists(parent) {
@@ -47,19 +112,16 @@ func detectMacvlanParent() (string, error) {
 		}
 		return parent, nil
 	}
-
 	if parent, err := defaultIPv4RouteParent(); err == nil && parent != "" {
 		if !linkExists(parent) {
 			return "", fmt.Errorf("默认出口网卡 %q 不存在或不可用", parent)
 		}
 		return parent, nil
 	}
-
 	if linkExists(defaultMacvlanParent) {
 		return defaultMacvlanParent, nil
 	}
-
-	return "", fmt.Errorf("无法自动识别默认出口网卡；请设置 %s=网卡名", macvlanParentEnv)
+	return "", fmt.Errorf("无法自动识别默认出口网卡，请设置 %s=网卡名", macvlanParentEnv)
 }
 
 func defaultIPv4RouteParent() (string, error) {
@@ -70,14 +132,12 @@ func defaultIPv4RouteParent() (string, error) {
 		}
 	}
 	showErr := err
-
 	out, err = exec.Command("ip", "-4", "route", "get", "1.1.1.1").Output()
 	if err == nil {
 		if dev := firstRouteDev(string(out)); dev != "" {
 			return dev, nil
 		}
 	}
-
 	if showErr != nil {
 		return "", fmt.Errorf("读取默认 IPv4 路由失败: %w", showErr)
 	}
@@ -95,10 +155,9 @@ func firstRouteDev(output string) string {
 				continue
 			}
 			dev := strings.TrimSpace(fields[i+1])
-			if dev == "" || dev == "lo" || dev == defaultHostMacvlanName {
-				continue
+			if dev != "" && dev != "lo" && dev != defaultHostMacvlanName {
+				return dev
 			}
-			return dev
 		}
 	}
 	return ""
@@ -108,127 +167,174 @@ func linkExists(name string) bool {
 	return exec.Command("ip", "link", "show", name).Run() == nil
 }
 
-// ──────────────────── 数据结构（对应 incus list --format json） ────────────────────
-
-// Container 对应 incus list --format json 的单个元素。
+// Container is the subset of api.InstanceFull used by the application.
 type Container struct {
-	Name            string                       `json:"name"`
-	Status          string                       `json:"status"`
-	StatusCode      int                          `json:"status_code"`
-	Type            string                       `json:"type"`
-	Config          map[string]string            `json:"config"`
-	Devices         map[string]map[string]string `json:"devices"`
-	ExpandedDevices map[string]map[string]string `json:"expanded_devices"`
-	State           *ContainerState              `json:"state"`
+	Name            string
+	Status          string
+	StatusCode      int
+	Type            string
+	Config          map[string]string
+	Devices         map[string]map[string]string
+	ExpandedDevices map[string]map[string]string
+	State           *ContainerState
 }
 
-// ContainerState 容器运行态。
 type ContainerState struct {
-	Network map[string]NICState `json:"network"`
-	Pid     int64               `json:"pid"`
+	Network map[string]NICState
+	Pid     int64
 }
 
-// NICState 网卡状态。
 type NICState struct {
-	Addresses []NICAddr `json:"addresses"`
-	HwAddr    string    `json:"hwaddr"`
-	State     string    `json:"state"`
-	Type      string    `json:"type"`
+	Addresses []NICAddr
+	HwAddr    string
+	State     string
+	Type      string
 }
 
-// NICAddr 网卡地址。
 type NICAddr struct {
-	Family  string `json:"family"`
-	Address string `json:"address"`
-	Scope   string `json:"scope"`
+	Family  string
+	Address string
+	Scope   string
 }
 
-// ──────────────────── 基础执行 ────────────────────
-
-// run 执行 incus 子命令并接管 stdio（交互式透传）。
-func (c *IncusClient) run(args ...string) error {
-	cmd := exec.Command("incus", args...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
-// capture 执行 incus 子命令并返回 stdout（不接管 stdio）。
-// 出错时附带 stderr 输出，便于排查。
-func (c *IncusClient) capture(args ...string) ([]byte, error) {
-	cmd := exec.Command("incus", args...)
-	out, err := cmd.Output()
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok && len(exitErr.Stderr) > 0 {
-			return nil, fmt.Errorf("%s\n%s", err, strings.TrimSpace(string(exitErr.Stderr)))
+func convertContainer(full *api.InstanceFull) *Container {
+	if full == nil {
+		return nil
+	}
+	c := &Container{
+		Name:            full.Name,
+		Status:          full.Status,
+		StatusCode:      int(full.StatusCode),
+		Type:            full.Type,
+		Config:          cloneConfig(full.Config),
+		Devices:         cloneDevices(full.Devices),
+		ExpandedDevices: cloneDevices(full.ExpandedDevices),
+	}
+	if full.State == nil {
+		return c
+	}
+	c.State = &ContainerState{Network: make(map[string]NICState), Pid: full.State.Pid}
+	for name, nic := range full.State.Network {
+		state := NICState{HwAddr: nic.Hwaddr, State: nic.State, Type: nic.Type}
+		for _, addr := range nic.Addresses {
+			state.Addresses = append(state.Addresses, NICAddr{Family: addr.Family, Address: addr.Address, Scope: addr.Scope})
 		}
-		return nil, err
+		c.State.Network[name] = state
 	}
-	return out, nil
+	return c
 }
 
-func (c *IncusClient) execQuiet(name string, args ...string) error {
-	full := append([]string{"exec", name, "--"}, args...)
-	cmd := exec.Command("incus", full...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("incus exec %s 失败: %w\n%s", name, err, strings.TrimSpace(string(out)))
+func cloneConfig(in api.ConfigMap) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
 	}
-	return nil
+	return out
 }
 
-// EnsureMirrorRemote 确保系统只保留清华镜像源：移除官方 images 源与可能指向
-// 其他地址的旧 mirror-images，再添加指向清华源的 mirror-images。
-// local 为本地 daemon，不在处理范围内。所有删除/添加错误均忽略（幂等）。
-func (c *IncusClient) EnsureMirrorRemote() {
-	// 移除官方 images 源（不存在或不可删则忽略）
-	_ = exec.Command("incus", "remote", "remove", "images").Run()
-	// 移除旧 mirror-images（可能指向非清华源），忽略错误
-	_ = exec.Command("incus", "remote", "remove", MirrorRemote).Run()
-	// 添加清华镜像源
-	_ = exec.Command("incus", "remote", "add", MirrorRemote, MirrorURL,
-		"--protocol=simplestreams", "--public").Run()
+func cloneDevices(in api.DevicesMap) map[string]map[string]string {
+	out := make(map[string]map[string]string, len(in))
+	for name, device := range in {
+		copyDevice := make(map[string]string, len(device))
+		for k, v := range device {
+			copyDevice[k] = v
+		}
+		out[name] = copyDevice
+	}
+	return out
 }
 
-// EnsureDefaultMacvlanProfile 确保新建容器默认使用 macvlan 直连物理网卡。
-// 这一步只修改 Incus default profile 的 eth0，不修改宿主机物理网卡。
+func apiConfig(in map[string]string) api.ConfigMap {
+	out := api.ConfigMap{}
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func apiDevices(in map[string]map[string]string) api.DevicesMap {
+	out := api.DevicesMap{}
+	for name, device := range in {
+		copyDevice := map[string]string{}
+		for k, v := range device {
+			copyDevice[k] = v
+		}
+		out[name] = copyDevice
+	}
+	return out
+}
+
+func writableInstance(full *api.InstanceFull) api.InstancePut {
+	p := full.Writable()
+	p.Config = apiConfig(cloneConfig(full.Config))
+	p.Devices = apiDevices(cloneDevices(full.Devices))
+	p.Profiles = append([]string(nil), full.Profiles...)
+	return p
+}
+
+func (c *IncusClient) updateInstance(name string, etag string, put api.InstancePut) error {
+	op, err := c.server.UpdateInstance(name, put, etag)
+	if err != nil {
+		return err
+	}
+	return op.Wait()
+}
+
+// EnsureMirrorRemote is retained for compatibility. REST image requests carry
+// the SimpleStreams server directly, so no local Incus remote is needed.
+func (c *IncusClient) EnsureMirrorRemote() {}
+
 func (c *IncusClient) EnsureDefaultMacvlanProfile() error {
+	if err := c.ready(); err != nil {
+		return err
+	}
 	parent, err := detectMacvlanParent()
 	if err != nil {
 		return err
 	}
-
-	_ = exec.Command("incus", "profile", "device", "remove", "default", defaultNICName).Run()
-	cmd := exec.Command("incus", "profile", "device", "add", "default", defaultNICName, "nic",
-		"nictype=macvlan", "parent="+parent)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("配置 default profile 的 %s macvlan 失败: %w\n%s", defaultNICName, err, strings.TrimSpace(string(out)))
+	profile, etag, err := c.server.GetProfile("default")
+	if err != nil {
+		return fmt.Errorf("获取 default profile 失败: %w", err)
+	}
+	devices := cloneDevices(profile.Devices)
+	eth0 := devices[defaultNICName]
+	if eth0 != nil && eth0["type"] == "nic" && eth0["nictype"] == "macvlan" && eth0["parent"] == parent {
+		return nil
+	}
+	devices[defaultNICName] = map[string]string{"type": "nic", "nictype": "macvlan", "parent": parent, "name": defaultNICName}
+	put := api.ProfilePut{Config: profile.Config, Description: profile.Description, Devices: apiDevices(devices)}
+	if err := c.server.UpdateProfile("default", put, etag); err != nil {
+		return fmt.Errorf("配置 default profile 的 %s macvlan 失败: %w", defaultNICName, err)
 	}
 	return nil
 }
-
-// ──────────────────── 生命周期 ────────────────────
 
 func (c *IncusClient) Start(name string) error {
-	// 启动前重新配置 eth0，确保使用 macvlan 直连物理网卡，同时保留已有容器 MAC。
-	if err := c.configureMacvlanNIC(name); err != nil {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	if err := c.configureMacvlanNIC(name, false); err != nil {
 		return fmt.Errorf("配置 %s macvlan 网络失败: %w", defaultNICName, err)
 	}
-	return c.run("start", name)
+	op, err := c.server.UpdateInstanceState(name, api.InstanceStatePut{Action: "start", Timeout: -1}, "")
+	if err != nil {
+		return err
+	}
+	return op.Wait()
 }
 
-// configureMacvlanNIC 配置容器 eth0 使用 macvlan 直连默认出口网卡。
-// 默认 profile 里可能继承了 incusbr0，这里用容器级 eth0 覆盖它，避免 NAT。
-// 注意：这里只配置容器虚拟网卡，不会修改宿主机物理网卡的 MAC。
-func (c *IncusClient) configureMacvlanNIC(name string) error {
+func (c *IncusClient) configureMacvlanNIC(name string, forceNewMAC bool) error {
+	full, etag, err := c.server.GetInstanceFull(name)
+	if err != nil {
+		return err
+	}
 	parent, err := detectMacvlanParent()
 	if err != nil {
 		return err
 	}
-
-	mac, err := c.containerNICMAC(name, defaultNICName)
-	if err != nil {
-		return err
+	mac := ""
+	if !forceNewMAC {
+		mac = convertContainer(full).NICMAC(defaultNICName)
 	}
 	if mac == "" {
 		mac, err = randomMAC()
@@ -236,185 +342,272 @@ func (c *IncusClient) configureMacvlanNIC(name string) error {
 			return err
 		}
 	}
-
-	args := []string{
-		"name=" + defaultNICName,
-		"nictype=macvlan",
-		"parent=" + parent,
-		"hwaddr=" + mac,
+	put := writableInstance(full)
+	devices := cloneDevices(full.Devices)
+	if devices == nil {
+		devices = map[string]map[string]string{}
 	}
-	// 先移除容器级 eth0（若存在），再优先覆盖 profile 继承的 eth0。
-	// 若没有继承设备，override 会失败，随后 add 会创建新的容器级 eth0。
-	// 移除前已经读取并保留原 hwaddr，避免每次启动/重新配置都换容器 MAC。
-	_ = exec.Command("incus", "config", "device", "remove", name, defaultNICName).Run()
-	if exec.Command("incus", append([]string{"config", "device", "override", name, defaultNICName}, args...)...).Run() == nil {
-		_ = exec.Command("incus", "config", "device", "unset", name, defaultNICName, "network").Run()
-		return nil
+	devices[defaultNICName] = map[string]string{
+		"type": "nic", "name": defaultNICName, "nictype": "macvlan", "parent": parent, "hwaddr": mac,
 	}
-	return exec.Command("incus", append([]string{"config", "device", "add", name, defaultNICName, "nic"}, args...)...).Run()
+	put.Devices = apiDevices(devices)
+	if err := c.updateInstance(name, etag, put); err != nil {
+		return err
+	}
+	return nil
 }
 
-// containerNICMAC 返回容器网卡已有 MAC，优先保留容器配置/运行态中的地址。
-// 这样重新应用 macvlan 配置时不会导致容器 DHCP 身份变化。
-func (c *IncusClient) containerNICMAC(name, nic string) (string, error) {
-	ct, err := c.GetContainer(name)
-	if err != nil {
-		return "", err
-	}
-
-	for _, devs := range []map[string]map[string]string{ct.Devices, ct.ExpandedDevices} {
-		if dev := devs[nic]; dev != nil {
-			if mac := strings.TrimSpace(dev["hwaddr"]); mac != "" {
-				return mac, nil
-			}
-		}
-	}
-
-	if ct.Config != nil {
-		if mac := strings.TrimSpace(ct.Config["volatile."+nic+".hwaddr"]); mac != "" {
-			return mac, nil
-		}
-	}
-
-	if ct.State != nil && ct.State.Network != nil {
-		if state, ok := ct.State.Network[nic]; ok {
-			if mac := strings.TrimSpace(state.HwAddr); mac != "" {
-				return mac, nil
-			}
-		}
-	}
-
-	return "", nil
-}
-
-// randomMAC 生成一个本地管理的随机 MAC 地址。
 func randomMAC() (string, error) {
 	buf := make([]byte, 6)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}
-	// 设置本地管理位 (bit 1 of first byte)，清除多播位 (bit 0)
 	buf[0] = (buf[0] | 0x02) & 0xfe
 	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]), nil
 }
-func (c *IncusClient) Stop(name string) error   { return c.run("stop", name) }
-func (c *IncusClient) Delete(name string) error { return c.run("delete", name, "--force") }
 
-// Exec 进入容器，优先用 bash（支持方向键/Tab补全/历史记录），无则回退 sh。
-// 先静默探测可用 shell，避免回退时打印迷惑的 "Command not found" 错误。
-func (c *IncusClient) Exec(name string) error {
-	bin, err := exec.LookPath("incus")
+func (c *IncusClient) Stop(name string) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	op, err := c.server.UpdateInstanceState(name, api.InstanceStatePut{Action: "stop", Timeout: 30}, "")
 	if err != nil {
-		return fmt.Errorf("找不到 incus 命令: %w", err)
+		return err
+	}
+	return op.Wait()
+}
+
+func (c *IncusClient) Delete(name string) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	op, err := c.server.DeleteInstance(name)
+	if err != nil {
+		return err
+	}
+	return op.Wait()
+}
+
+func defaultExecEnv() map[string]string {
+	term := os.Getenv("TERM")
+	if term == "" {
+		term = "xterm-256color"
+	}
+	return map[string]string{
+		"HOME": "/root",
+		"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"TERM": term,
+		"USER": "root",
+	}
+}
+
+func (c *IncusClient) Exec(name string) error {
+	if err := c.ready(); err != nil {
+		return err
 	}
 	shell := "/bin/sh"
-	for _, sh := range []string{"/bin/bash", "/bin/sh"} {
-		if err := exec.Command(bin, "exec", name, "--", "test", "-x", sh).Run(); err == nil {
-			shell = sh
-			break
-		}
+	if out, _ := c.execQuiet(name, "/bin/sh", "-c", "if test -x /bin/bash; then echo yes; fi"); out == "yes" {
+		shell = "/bin/bash"
 	}
-	cmd := exec.Command(bin, "exec", "-t", name, "--", shell)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	fd := int(os.Stdin.Fd())
+	if old, err := makeRaw(fd); err == nil {
+		defer restoreTerm(fd, old)
+	}
+	width, height := 120, 40
+	if w, h, err := term.GetSize(fd); err == nil && w > 0 && h > 0 {
+		width, height = w, h
+	}
+	req := api.InstanceExecPost{
+		Command:     []string{shell},
+		Environment: defaultExecEnv(),
+		WaitForWS:   true,
+		Interactive: true,
+		Width:       width,
+		Height:      height,
+	}
+	op, err := c.server.ExecInstance(name, req, &incus.InstanceExecArgs{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr})
+	if err != nil {
 		return fmt.Errorf("无法进入容器 %s 的 shell: %w", name, err)
+	}
+	if err := op.Wait(); err != nil {
+		return fmt.Errorf("进入容器 %s 的 shell 断开或执行失败: %w", name, err)
 	}
 	return nil
 }
 
-// Launch 从镜像源创建新容器，并配置 macvlan 直连默认出口网卡后启动。
-func (c *IncusClient) Launch(imageRef, name string) error {
-	if err := c.run("init", imageRef, name); err != nil {
-		return err
+func (c *IncusClient) execQuiet(name string, args ...string) (string, error) {
+	if err := c.ready(); err != nil {
+		return "", err
 	}
-	if err := c.configureMacvlanNIC(name); err != nil {
-		return fmt.Errorf("配置 %s macvlan 网络失败: %w", defaultNICName, err)
+	req := api.InstanceExecPost{
+		Command:     args,
+		Environment: defaultExecEnv(),
+		WaitForWS:   true,
+		Interactive: false,
 	}
-	return c.run("start", name)
+	var out bytes.Buffer
+	op, err := c.server.ExecInstance(name, req, &incus.InstanceExecArgs{
+		Stdin: strings.NewReader(""), Stdout: &out, Stderr: io.Discard,
+	})
+	if err != nil {
+		return "", err
+	}
+	err = op.Wait()
+	return strings.TrimSpace(out.String()), err
 }
 
-// ──────────────────── 查询 ────────────────────
+func (c *IncusClient) Launch(imageRef, name string) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	alias := imageRef
+	if idx := strings.IndexByte(imageRef, ':'); idx >= 0 {
+		alias = imageRef[idx+1:]
+	}
+	req := api.InstancesPost{
+		Name: name,
+		Type: api.InstanceTypeContainer,
+		Source: api.InstanceSource{
+			Type: "image", Alias: alias, Server: MirrorURL, Protocol: "simplestreams",
+		},
+		Start: false,
+	}
+	op, err := c.server.CreateInstance(req)
+	if err != nil {
+		return err
+	}
+	if err := op.Wait(); err != nil {
+		return err
+	}
+	return c.Start(name)
+}
 
-// ListContainers 解析 incus list --format json。
 func (c *IncusClient) ListContainers() ([]Container, error) {
-	out, err := c.capture("list", "--format", "json")
+	if err := c.ready(); err != nil {
+		return nil, err
+	}
+	instances, err := c.server.GetInstancesFull(api.InstanceTypeContainer)
 	if err != nil {
 		return nil, fmt.Errorf("获取容器列表失败: %w", err)
 	}
-	var cs []Container
-	if err := json.Unmarshal(out, &cs); err != nil {
-		return nil, fmt.Errorf("解析容器列表失败: %w", err)
+	result := make([]Container, 0, len(instances))
+	for i := range instances {
+		result = append(result, *convertContainer(&instances[i]))
 	}
-	return cs, nil
+	return result, nil
 }
 
-// GetContainer 获取单个容器信息。
 func (c *IncusClient) GetContainer(name string) (*Container, error) {
-	cs, err := c.ListContainers()
-	if err != nil {
+	if err := c.ready(); err != nil {
 		return nil, err
 	}
-	for i := range cs {
-		if cs[i].Name == name {
-			return &cs[i], nil
-		}
+	instance, _, err := c.server.GetInstanceFull(name)
+	if err != nil {
+		return nil, fmt.Errorf("获取容器 %q 失败: %w", name, err)
 	}
-	return nil, fmt.Errorf("容器 %q 不存在", name)
+	return convertContainer(instance), nil
 }
 
-// ──────────────────── 配置 ────────────────────
-
-// SetBootAutostart 设置开机自启。
 func (c *IncusClient) SetBootAutostart(name string, on bool) error {
-	val := "false"
-	if on {
-		val = "true"
+	full, etag, err := c.server.GetInstanceFull(name)
+	if err != nil {
+		return err
 	}
-	return c.run("config", "set", name, "boot.autostart="+val)
+	put := writableInstance(full)
+	if put.Config == nil {
+		put.Config = api.ConfigMap{}
+	}
+	put.Config["boot.autostart"] = strconv.FormatBool(on)
+	return c.updateInstance(name, etag, put)
 }
 
-// SetDomain 设置域名映射（存于 user.sb_lxc.domain 配置项）。
 func (c *IncusClient) SetDomain(name, domain string) error {
-	return c.run("config", "set", name, "user.sb_lxc.domain="+domain)
-}
-
-// UnsetDomain 取消域名映射。
-func (c *IncusClient) UnsetDomain(name string) error {
-	return c.run("config", "unset", name, "user.sb_lxc.domain")
-}
-
-
-
-// Export 导出容器为 tar.gz 文件。
-func (c *IncusClient) Export(name, path string) error {
-	return c.run("export", name, path)
-}
-
-// Import 从 tar.gz 文件导入容器。
-func (c *IncusClient) Import(path, name string) error {
-	return c.run("import", path, name)
-}
-
-// ConfigureDefaultNetwork 为已存在容器应用默认 macvlan 网络配置。
-func (c *IncusClient) ConfigureDefaultNetwork(name string) error {
-	if err := c.configureMacvlanNIC(name); err != nil {
-		return fmt.Errorf("配置 %s macvlan 网络失败: %w", defaultNICName, err)
+	full, etag, err := c.server.GetInstanceFull(name)
+	if err != nil {
+		return err
 	}
-	return nil
+	put := writableInstance(full)
+	if put.Config == nil {
+		put.Config = api.ConfigMap{}
+	}
+	put.Config["user.sb_lxc.domain"] = domain
+	return c.updateInstance(name, etag, put)
 }
 
-// ──────────────────── Container 便捷方法 ────────────────────
+func (c *IncusClient) UnsetDomain(name string) error {
+	full, etag, err := c.server.GetInstanceFull(name)
+	if err != nil {
+		return err
+	}
+	put := writableInstance(full)
+	delete(put.Config, "user.sb_lxc.domain")
+	return c.updateInstance(name, etag, put)
+}
 
+func (c *IncusClient) Export(name, path string) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	backup := api.InstanceBackupsPost{CompressionAlgorithm: "gzip"}
+	err = c.server.CreateInstanceBackupStream(name, backup, &incus.BackupFileRequest{BackupFile: f})
+	if err == nil {
+		return nil
+	}
+	// Older servers may not expose direct_backup. Fall back to a temporary
+	// persisted backup and download it through the standard REST endpoint.
+	if _, seekErr := f.Seek(0, io.SeekStart); seekErr == nil {
+		_ = f.Truncate(0)
+	}
+	backup.Name = fmt.Sprintf("sb-lxc-export-%d", time.Now().UnixNano())
+	op, createErr := c.server.CreateInstanceBackup(name, backup)
+	if createErr != nil {
+		return fmt.Errorf("导出备份失败: %w (direct backup: %v)", createErr, err)
+	}
+	if createErr = op.Wait(); createErr != nil {
+		return createErr
+	}
+	defer func() {
+		if deleteOp, e := c.server.DeleteInstanceBackup(name, backup.Name); e == nil {
+			_ = deleteOp.Wait()
+		}
+	}()
+	_, downloadErr := c.server.GetInstanceBackupFile(name, backup.Name, &incus.BackupFileRequest{BackupFile: f})
+	return downloadErr
+}
 
+func (c *IncusClient) Import(path, name string) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	op, err := c.server.CreateInstanceFromBackup(incus.InstanceBackupArgs{BackupFile: f, Name: name})
+	if err != nil {
+		return err
+	}
+	return op.Wait()
+}
+
+func (c *IncusClient) ConfigureDefaultNetwork(name string) error {
+	return c.configureMacvlanNIC(name, false)
+}
+
+func (c *IncusClient) ConfigureImportedNetwork(name string) error {
+	return c.configureMacvlanNIC(name, true)
+}
 
 func (ct *Container) NICMAC(nic string) string {
 	for _, devs := range []map[string]map[string]string{ct.Devices, ct.ExpandedDevices} {
-		if dev := devs[nic]; dev != nil {
-			if mac := strings.TrimSpace(dev["hwaddr"]); mac != "" {
-				return mac
-			}
+		if dev := devs[nic]; dev != nil && strings.TrimSpace(dev["hwaddr"]) != "" {
+			return strings.TrimSpace(dev["hwaddr"])
 		}
 	}
 	if ct.Config != nil {
@@ -422,7 +615,7 @@ func (ct *Container) NICMAC(nic string) string {
 			return mac
 		}
 	}
-	if ct.State != nil && ct.State.Network != nil {
+	if ct.State != nil {
 		if state, ok := ct.State.Network[nic]; ok {
 			return strings.TrimSpace(state.HwAddr)
 		}
@@ -431,187 +624,130 @@ func (ct *Container) NICMAC(nic string) string {
 }
 
 func (ct *Container) UsesMacvlanNIC(nic string) bool {
-	devs := ct.ExpandedDevices
-	if devs == nil {
-		devs = ct.Devices
-	}
-	dev := devs[nic]
+	dev := ct.ExpandedDevices[nic]
 	if dev == nil {
-		return false
+		dev = ct.Devices[nic]
 	}
-	return dev["type"] == "nic" && dev["nictype"] == "macvlan"
+	return dev != nil && dev["type"] == "nic" && dev["nictype"] == "macvlan"
 }
 
-
-
-// IPv4 返回首个全局 IPv4 地址。
 func (ct *Container) IPv4() string {
-	if ct.State == nil || ct.State.Network == nil {
+	if ct.State == nil {
 		return ""
 	}
 	for name, nic := range ct.State.Network {
 		if name == "lo" || nic.Type == "loopback" {
 			continue
 		}
-		for _, a := range nic.Addresses {
-			if a.Family == "inet" && a.Scope == "global" {
-				return a.Address
+		for _, addr := range nic.Addresses {
+			if addr.Family == "inet" && addr.Scope == "global" {
+				return addr.Address
 			}
 		}
 	}
 	return ""
 }
 
-// IPv6 返回首个全局 IPv6 地址。
 func (ct *Container) IPv6() string {
-	if ct.State == nil || ct.State.Network == nil {
+	if ct.State == nil {
 		return ""
 	}
 	for name, nic := range ct.State.Network {
 		if name == "lo" || nic.Type == "loopback" {
 			continue
 		}
-		for _, a := range nic.Addresses {
-			if a.Family == "inet6" && a.Scope == "global" {
-				return a.Address
+		for _, addr := range nic.Addresses {
+			if addr.Family == "inet6" && addr.Scope == "global" {
+				return addr.Address
 			}
 		}
 	}
 	return ""
 }
 
-// Autostart 返回 boot.autostart 配置值（未设置则为空）。
-func (ct *Container) Autostart() string {
-	return ct.Config["boot.autostart"]
-}
+func (ct *Container) Autostart() string { return ct.Config["boot.autostart"] }
+func (ct *Container) Domain() string    { return ct.Config["user.sb_lxc.domain"] }
 
-// Domain 返回域名映射配置值（未设置则为空）。
-func (ct *Container) Domain() string {
-	return ct.Config["user.sb_lxc.domain"]
-}
-
-
-
-// ──────────────────── 镜像查询 ────────────────────
-
-// Image 对应 incus image list --format json 的单个元素。
 type Image struct {
-	Architecture string            `json:"architecture"`
-	Type         string            `json:"type"`
-	Aliases      []ImageAlias      `json:"aliases"`
-	Properties   map[string]string `json:"properties"`
-	Size         int64             `json:"size"`
+	Architecture string
+	Type         string
+	Aliases      []ImageAlias
+	Properties   map[string]string
+	Size         int64
 }
 
-// ImageAlias 镜像别名。
-type ImageAlias struct {
-	Name string `json:"name"`
-}
+type ImageAlias struct{ Name string }
 
-// ImageVersion 镜像的某个具体版本。
 type ImageVersion struct {
-	Release string // 版本号/代号，如 "bookworm"
-	Image   string // 镜像引用，如 "debian/bookworm"
+	Release string
+	Image   string
 }
 
-// DistroGroup 发行版分组：发行版名 → 该发行版下所有可选版本。
 type DistroGroup struct {
-	Distro   string // 发行版名，如 "Debian"
+	Distro   string
 	Versions []ImageVersion
 }
 
-// ListImages 从镜像源拉取 x86_64 容器镜像，按发行版分组、版本聚合返回。
-// 排除 cloud 变体，按 os(一级) + release(二级) 去重，取最短 alias 作为引用。
 func (c *IncusClient) ListImages() ([]DistroGroup, error) {
-	out, err := c.capture("image", "list", MirrorRemote+":", "--format", "json")
+	remote, err := c.imageServer()
+	if err != nil {
+		return nil, err
+	}
+	images, err := remote.GetImages()
 	if err != nil {
 		return nil, fmt.Errorf("获取镜像列表失败: %w", err)
 	}
-	var imgs []Image
-	if err := json.Unmarshal(out, &imgs); err != nil {
-		return nil, fmt.Errorf("解析镜像列表失败: %w", err)
-	}
-
 	const arch = "x86_64"
-	// 只保留这些发行版
-	allowedDistros := map[string]bool{
-		"alpine":     true,
-		"centos":     true,
-		"debian":     true,
-		"nixos":      true,
-		"ubuntu":     true,
-		"oracle":     true,
-		"rockylinux": true,
-	}
-	// distro(lower) -> {release(lower) -> shortest alias}
+	allowedDistros := map[string]bool{"alpine": true, "centos": true, "debian": true, "nixos": true, "ubuntu": true, "oracle": true, "rockylinux": true}
 	grouped := map[string]map[string]string{}
 	distroOrder := []string{}
-
-	for _, img := range imgs {
-		if img.Type != "container" || img.Architecture != arch {
+	for _, img := range images {
+		if img.Type != "container" || img.Architecture != arch || img.Properties["variant"] == "cloud" {
 			continue
 		}
-		p := img.Properties
-		if p["variant"] == "cloud" {
+		osName, release := img.Properties["os"], img.Properties["release"]
+		if osName == "" || release == "" {
 			continue
 		}
-		osName := p["os"]
-		rel := p["release"]
-		if osName == "" || rel == "" {
-			continue
-		}
-		osKey := strings.ToLower(osName)
+		osKey, relKey := strings.ToLower(osName), strings.ToLower(release)
 		if !allowedDistros[osKey] {
 			continue
 		}
-		relKey := strings.ToLower(rel)
-
-		// 取最短 alias
 		shortest := ""
-		for _, a := range img.Aliases {
-			n := a.Name
-			if shortest == "" || len(n) < len(shortest) {
-				shortest = n
+		for _, alias := range img.Aliases {
+			if shortest == "" || len(alias.Name) < len(shortest) {
+				shortest = alias.Name
 			}
 		}
 		if shortest == "" {
 			continue
 		}
-
-		if _, ok := grouped[osKey]; !ok {
+		if grouped[osKey] == nil {
 			grouped[osKey] = map[string]string{}
 			distroOrder = append(distroOrder, osKey)
 		}
-		if cur, ok := grouped[osKey][relKey]; !ok || len(shortest) < len(cur) {
+		if current := grouped[osKey][relKey]; current == "" || len(shortest) < len(current) {
 			grouped[osKey][relKey] = shortest
 		}
 	}
-
 	sort.Strings(distroOrder)
-
 	result := make([]DistroGroup, 0, len(distroOrder))
 	for _, osKey := range distroOrder {
 		rels := grouped[osKey]
 		relKeys := make([]string, 0, len(rels))
-		for k := range rels {
-			relKeys = append(relKeys, k)
+		for release := range rels {
+			relKeys = append(relKeys, release)
 		}
 		sort.Strings(relKeys)
-
 		versions := make([]ImageVersion, 0, len(relKeys))
-		for _, rk := range relKeys {
-			ref := strings.TrimSuffix(rels[rk], "/default")
-			versions = append(versions, ImageVersion{Release: rk, Image: ref})
+		for _, release := range relKeys {
+			versions = append(versions, ImageVersion{Release: release, Image: strings.TrimSuffix(rels[release], "/default")})
 		}
-		result = append(result, DistroGroup{
-			Distro:   titleCase(osKey),
-			Versions: versions,
-		})
+		result = append(result, DistroGroup{Distro: titleCase(osKey), Versions: versions})
 	}
 	return result, nil
 }
 
-// titleCase 首字母大写。
 func titleCase(s string) string {
 	if s == "" {
 		return s

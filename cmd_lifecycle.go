@@ -125,18 +125,18 @@ func CmdImport(args []string) error {
 		if err := client.Import(path, name); err != nil {
 			return err
 		}
-		if err := client.ConfigureDefaultNetwork(name); err != nil {
+		if err := client.ConfigureImportedNetwork(name); err != nil {
 			return err
 		}
 	} else {
-		if err := client.run("import", path); err != nil {
+		if err := client.Import(path, ""); err != nil {
 			return err
 		}
 		importedName := findImportedContainerName(client, before)
 		if importedName == "" {
 			return fmt.Errorf("导入完成，但无法确认新容器名，未配置 macvlan 网络")
 		}
-		if err := client.ConfigureDefaultNetwork(importedName); err != nil {
+		if err := client.ConfigureImportedNetwork(importedName); err != nil {
 			return err
 		}
 	}

@@ -1,0 +1,17 @@
+# nfpm configuration for sb-lxc
+name: "sb-lxc"
+arch: "${DEB_ARCH}"
+platform: "linux"
+version: "${VERSION}"
+section: "utils"
+priority: "optional"
+maintainer: "root <root@localhost>"
+description: "Simple Incus container management CLI"
+depends:
+  - incus
+
+contents:
+  - src: "./dist/sb_lxc"
+    dst: "/usr/local/bin/sb_lxc"
+    file_info:
+      mode: 0755

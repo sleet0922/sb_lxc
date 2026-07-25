@@ -49,13 +49,13 @@ func dispatch(cmd string, args []string) error {
 	case "in":
 		return withContainer(args, "选择要进入的容器", CmdIn)
 	case "set":
-		return withContainer(args, "选择要设置的容器", CmdSet)
+		return CmdSet(args)
 	case "export":
 		return withContainer(args, "选择要导出的容器", CmdExport)
 	case "import":
 		return CmdImport(args)
 	case "install", "i":
-		return CmdInstall()
+		return CmdInstall(args)
 	case "uninstall", "rm":
 		return CmdUninstall()
 	case "help", "-h", "--help":

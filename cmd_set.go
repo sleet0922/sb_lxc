@@ -1,18 +1,52 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
-	"os"
 	"strings"
 )
 
-// CmdSet 容器设置：交互式菜单选择域名映射 / 开关开机自启。
-func CmdSet(name string) error {
+// CmdSet 容器设置：交互式菜单或直接命令行参数设置。
+func CmdSet(args []string) error {
 	client := NewIncusClient()
+	name := ""
+	if len(args) >= 1 {
+		name = args[0]
+	} else {
+		var err error
+		name, err = selectContainer("选择要设置的容器")
+		if err != nil || name == "" {
+			return err
+		}
+	}
+
 	ct, err := client.GetContainer(name)
 	if err != nil {
 		return err
+	}
+
+	if len(args) >= 2 {
+		sub := strings.ToLower(args[1])
+		switch sub {
+		case "domain", "host", "dns":
+			if len(args) >= 3 && args[2] != "--unset" && args[2] != "" {
+				return applyDomain(client, ct, args[2])
+			}
+			return removeDomain(client, ct)
+		case "autostart":
+			on := true
+			if len(args) >= 3 && (args[2] == "off" || args[2] == "false" || args[2] == "0") {
+				on = false
+			}
+			if err := client.SetBootAutostart(name, on); err != nil {
+				return err
+			}
+			if on {
+				fmt.Printf("✔ 容器 %s 已开启开机自启动\n", name)
+			} else {
+				fmt.Printf("✔ 容器 %s 已关闭开机自启动\n", name)
+			}
+			return nil
+		}
 	}
 
 	options := []string{
@@ -31,7 +65,8 @@ func CmdSet(name string) error {
 
 	switch choice {
 	case 0:
-		return setDomain(client, ct)
+		domain := prompt("域名 (如 alpine.test): ")
+		return applyDomain(client, ct, domain)
 	case 1:
 		return removeDomain(client, ct)
 	case 2:
@@ -56,11 +91,8 @@ func orNA(s string) string {
 	return s
 }
 
-
 // setDomain 设置域名映射，若容器已运行则立即更新 /etc/hosts。
-func setDomain(client *IncusClient, ct *Container) error {
-	r := bufio.NewReader(os.Stdin)
-	domain := prompt(r, "域名 (如 alpine.test): ")
+func applyDomain(client *IncusClient, ct *Container, domain string) error {
 	if domain == "" {
 		return fmt.Errorf("域名不能为空")
 	}

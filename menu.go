@@ -7,8 +7,11 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"unsafe"
+
+	"golang.org/x/term"
 )
+
+var stdinReader = bufio.NewReader(os.Stdin)
 
 // selectMenu 交互式上下键选择菜单，返回选中索引；-1 表示取消。
 // 支持：↑↓/jk 选择、Enter 确认、q/Ctrl+C 退出、数字键直选。
@@ -34,21 +37,20 @@ func selectMenu(options []string, prompt string) int {
 	m := &menu{out: os.Stdout}
 	m.render(options, 0, prompt)
 
-	reader := bufio.NewReader(os.Stdin)
 	selected := 0
 	for {
-		b, err := reader.ReadByte()
+		b, err := stdinReader.ReadByte()
 		if err != nil {
 			return -1
 		}
 		switch b {
 		case 0x1b: // ESC 序列
-			b2, err := reader.ReadByte()
+			b2, err := stdinReader.ReadByte()
 			if err != nil {
 				return -1
 			}
 			if b2 == '[' {
-				b3, _ := reader.ReadByte()
+				b3, _ := stdinReader.ReadByte()
 				switch b3 {
 				case 'A': // ↑
 					if selected > 0 {
@@ -121,8 +123,7 @@ func fallbackSelect(options []string, prompt string) int {
 		fmt.Printf("  %d) %s\n", i+1, opt)
 	}
 	fmt.Print("请输入序号: ")
-	reader := bufio.NewReader(os.Stdin)
-	line, _ := reader.ReadString('\n')
+	line, _ := stdinReader.ReadString('\n')
 	line = strings.TrimSpace(line)
 	var n int
 	fmt.Sscanf(line, "%d", &n)
@@ -133,53 +134,20 @@ func fallbackSelect(options []string, prompt string) int {
 }
 
 // prompt 从标准输入读取一行（去空白）。
-func prompt(r *bufio.Reader, label string) string {
+func prompt(label string) string {
 	fmt.Print(label)
-	s, _ := r.ReadString('\n')
+	s, _ := stdinReader.ReadString('\n')
 	return strings.TrimSpace(s)
 }
 
-// ──────────────────── termios 原始模式（零依赖，纯 syscall） ────────────────────
+// ──────────────────── termios 原始模式（跨平台 golang.org/x/term） ────────────────────
 
-func makeRaw(fd int) (*syscall.Termios, error) {
-	var old syscall.Termios
-	if err := tcgetattr(fd, &old); err != nil {
-		return nil, err
-	}
-	raw := old
-	// 关回显、规范模式与信号产生；保留 OPOST 使 \n 正常转 \r\n。
-	// 清除 ISIG 后 Ctrl+C 不再触发 SIGINT，而是作为字节 0x03 被读取，
-	// 避免进程被信号杀死导致 defer restoreTerm 来不及执行。
-	raw.Iflag &^= syscall.IXON | syscall.BRKINT
-	raw.Lflag &^= syscall.ECHO | syscall.ICANON | syscall.IEXTEN | syscall.ISIG
-	raw.Cflag &^= syscall.CSIZE
-	raw.Cflag |= syscall.CS8
-	raw.Cc[syscall.VMIN] = 1
-	raw.Cc[syscall.VTIME] = 0
-	if err := tcsetattr(fd, &raw); err != nil {
-		return nil, err
-	}
-	return &old, nil
+func makeRaw(fd int) (*term.State, error) {
+	return term.MakeRaw(fd)
 }
 
-func restoreTerm(fd int, state *syscall.Termios) {
-	_ = tcsetattr(fd, state)
-}
-
-func tcgetattr(fd int, t *syscall.Termios) error {
-	_, _, e := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd),
-		uintptr(syscall.TCGETS), uintptr(unsafe.Pointer(t)))
-	if e != 0 {
-		return e
+func restoreTerm(fd int, state *term.State) {
+	if state != nil {
+		_ = term.Restore(fd, state)
 	}
-	return nil
-}
-
-func tcsetattr(fd int, t *syscall.Termios) error {
-	_, _, e := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd),
-		uintptr(syscall.TCSETS), uintptr(unsafe.Pointer(t)))
-	if e != 0 {
-		return e
-	}
-	return nil
 }
