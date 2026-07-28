@@ -44,12 +44,3 @@ func autostartBadge(v string) string {
 		return "-"
 	}
 }
-
-// trunc 截断过长字符串。
-func trunc(s string, n int) string {
-	rs := []rune(s)
-	if len(rs) <= n {
-		return s
-	}
-	return string(rs[:n]) + "…"
-}

@@ -395,6 +395,9 @@ func (c *IncusClient) Start(name string) error {
 }
 
 func (c *IncusClient) configureMacvlanNIC(name string, forceNewMAC bool) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
 	full, etag, err := c.server.GetInstanceFull(name)
 	if err != nil {
 		return err
@@ -587,6 +590,9 @@ func (c *IncusClient) GetContainer(name string) (*Container, error) {
 }
 
 func (c *IncusClient) SetBootAutostart(name string, on bool) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
 	full, etag, err := c.server.GetInstanceFull(name)
 	if err != nil {
 		return err
@@ -600,6 +606,9 @@ func (c *IncusClient) SetBootAutostart(name string, on bool) error {
 }
 
 func (c *IncusClient) SetDomain(name, domain string) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
 	full, etag, err := c.server.GetInstanceFull(name)
 	if err != nil {
 		return err
@@ -613,6 +622,9 @@ func (c *IncusClient) SetDomain(name, domain string) error {
 }
 
 func (c *IncusClient) UnsetDomain(name string) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
 	full, etag, err := c.server.GetInstanceFull(name)
 	if err != nil {
 		return err
@@ -682,6 +694,9 @@ func (c *IncusClient) Import(path, name string) error {
 // EnsurePrivileged 确保容器以高权限运行 (security.privileged=true)。
 // 已是高权限则跳过。用于导入/迁移场景保持策略一致。
 func (c *IncusClient) EnsurePrivileged(name string) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
 	full, etag, err := c.server.GetInstanceFull(name)
 	if err != nil {
 		return err
@@ -695,10 +710,6 @@ func (c *IncusClient) EnsurePrivileged(name string) error {
 	}
 	put.Config["security.privileged"] = "true"
 	return c.updateInstance(name, etag, put)
-}
-
-func (c *IncusClient) ConfigureDefaultNetwork(name string) error {
-	return c.configureMacvlanNIC(name, false)
 }
 
 func (c *IncusClient) ConfigureImportedNetwork(name string) error {
@@ -742,23 +753,6 @@ func (ct *Container) IPv4() string {
 		}
 		for _, addr := range nic.Addresses {
 			if addr.Family == "inet" && addr.Scope == "global" {
-				return addr.Address
-			}
-		}
-	}
-	return ""
-}
-
-func (ct *Container) IPv6() string {
-	if ct.State == nil {
-		return ""
-	}
-	for name, nic := range ct.State.Network {
-		if name == "lo" || nic.Type == "loopback" {
-			continue
-		}
-		for _, addr := range nic.Addresses {
-			if addr.Family == "inet6" && addr.Scope == "global" {
 				return addr.Address
 			}
 		}
