@@ -55,6 +55,7 @@ type PortSpec struct {
 }
 
 // parseIncusfile 从指定路径解析 Incusfile。path 为空时默认 ./Incusfile。
+// 支持行尾反斜杠续行 (与 Dockerfile 一致)：行尾 \ 会把下一行拼接到当前行。
 func parseIncusfile(path string) (*Incusfile, error) {
 	if path == "" {
 		path = "Incusfile"
@@ -64,9 +65,35 @@ func parseIncusfile(path string) (*Incusfile, error) {
 		return nil, fmt.Errorf("读取 %s 失败: %w", path, err)
 	}
 	f := &Incusfile{Path: path}
-	lines := strings.Split(string(data), "\n")
-	for i, raw := range lines {
-		lineNo := i + 1
+	// 规范化换行：去掉 \r (兼容 Windows CRLF)，再按 \n 切分
+	cleaned := strings.ReplaceAll(string(data), "\r\n", "\n")
+	cleaned = strings.ReplaceAll(cleaned, "\r", "\n")
+	// 预处理：合并以 \ 结尾的续行，记录每条逻辑行起始的物理行号
+	rawLines := strings.Split(cleaned, "\n")
+	type logicalLine struct {
+		no   int
+		text string
+	}
+	var logical []logicalLine
+	for i := 0; i < len(rawLines); i++ {
+		startNo := i + 1
+		cur := rawLines[i]
+		// 注释 / 空行不参与续行
+		trimmed := strings.TrimSpace(cur)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			logical = append(logical, logicalLine{no: startNo, text: cur})
+			continue
+		}
+		// 合并后续以 \ 结尾的行
+		for strings.HasSuffix(cur, "\\") && i+1 < len(rawLines) {
+			cur = strings.TrimSuffix(cur, "\\") + " " + strings.TrimLeft(rawLines[i+1], " \t")
+			i++
+		}
+		logical = append(logical, logicalLine{no: startNo, text: cur})
+	}
+	for _, ll := range logical {
+		lineNo := ll.no
+		raw := ll.text
 		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue

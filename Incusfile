@@ -1,0 +1,74 @@
+# Incusfile 复杂范例：多服务容器 (nginx + python app + dnsmasq + ssh)
+# 演示所有指令的用法、顺序依赖、ENV 跨指令引用、多端口 TCP+UDP
+#
+# 用法: sb_lxc build
+# 测试: curl http://complex.test  (需宿主机 /etc/hosts 已写入域名)
+
+# ─────────── 基础镜像 ───────────
+FROM debian/12
+NAME complex-demo
+
+# ─────────── 系统初始化 ───────────
+# 阶段 1: 安装多个服务
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    nginx python3 python3-pip dnsmasq openssh-server curl sudo vim
+
+# 阶段 2: 创建目录结构 (后续 COPY 依赖这些目录)
+RUN mkdir -p /app/web /app/scripts /app/config /app/logs /app/data
+RUN mkdir -p /var/run/sshd
+
+# ─────────── 环境变量 ───────────
+# 阶段 3: ENV 设置 (后续 RUN 中可用 $VAR 引用)
+ENV APP_NAME=complex-demo
+ENV APP_VERSION=1.0.0
+ENV WEB_PORT=8080
+ENV DNS_PORT=5353
+ENV SSH_USER=root
+
+# ─────────── 文件复制 ───────────
+# 阶段 4: COPY 文件 (依赖阶段 2 创建的目录)
+COPY ./app/index.html /app/web/index.html
+COPY ./app/config.yaml /app/config/config.yaml
+COPY ./app/start.sh /app/scripts/start.sh
+COPY ./app/dnsmasq.conf /app/config/dnsmasq.conf
+COPY ./app/app.py /app/scripts/app.py
+
+# ─────────── 配置生成 (使用 ENV) ───────────
+# 阶段 5: 使用 ENV 变量生成配置
+RUN echo "App: $APP_NAME v$APP_VERSION" > /app/config/version.txt
+RUN echo "Built at $(date) by sb_lxc" >> /app/config/version.txt
+RUN echo "Web port: $WEB_PORT, DNS port: $DNS_PORT" >> /app/config/version.txt
+
+# 阶段 6: 设置脚本权限
+RUN chmod +x /app/scripts/start.sh /app/scripts/app.py
+
+# ─────────── 服务配置 ───────────
+# 阶段 7: 配置 nginx (使用 COPY 的 web 文件作为默认站点)
+RUN rm -f /etc/nginx/sites-enabled/default
+RUN printf 'server {\n    listen 80 default_server;\n    listen [::]:80 default_server;\n    root /app/web;\n    index index.html;\n    server_name _;\n    location / {\n        try_files $uri $uri/ =404;\n    }\n}\n' > /etc/nginx/sites-enabled/complex
+
+# 阶段 8: 配置 dnsmasq
+RUN cp /app/config/dnsmasq.conf /etc/dnsmasq.conf
+RUN echo "address=/complex.test/127.0.0.1" >> /etc/dnsmasq.conf
+
+# 阶段 9: 配置 ssh (允许 root 登录)
+RUN echo 'root:toor' | chpasswd
+RUN sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+RUN sed -i 's/#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+
+# 阶段 10: 创建数据文件 (验证 RUN 序列执行)
+RUN echo '{"users":["alice","bob"],"version":"'$APP_VERSION'"}' > /app/data/db.json
+
+# ─────────── 验证 ───────────
+# 阶段 11: 打印构建信息 (验证 ENV 和文件都就位)
+RUN echo "=== Build Verification ===" && \
+    cat /app/config/version.txt && \
+    echo "---" && \
+    ls -la /app/web/ /app/scripts/ /app/config/ /app/data/ && \
+    echo "---" && \
+    echo "All files in place!"
+
+# ─────────── 运行时配置 ───────────
+EXPOSE 80/tcp 22/tcp 5353/udp
+DOMAIN complex.test
+AUTOSTART on
