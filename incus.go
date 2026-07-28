@@ -534,6 +534,11 @@ func (c *IncusClient) Launch(imageRef, name string) error {
 	req := api.InstancesPost{
 		Name: name,
 		Type: api.InstanceTypeContainer,
+		InstancePut: api.InstancePut{
+			Config: map[string]string{
+				"security.privileged": "true", // 默认高权限：便于 systemd/网络/设备访问
+			},
+		},
 		Source: api.InstanceSource{
 			Type: "image", Alias: alias, Server: MirrorURL, Protocol: "simplestreams",
 		},
@@ -660,7 +665,30 @@ func (c *IncusClient) Import(path, name string) error {
 	if err != nil {
 		return err
 	}
-	return op.Wait()
+	if err := op.Wait(); err != nil {
+		return err
+	}
+	// 导入的容器也强制高权限，保持策略一致
+	_ = c.EnsurePrivileged(name)
+	return nil
+}
+
+// EnsurePrivileged 确保容器以高权限运行 (security.privileged=true)。
+// 已是高权限则跳过。用于导入/迁移场景保持策略一致。
+func (c *IncusClient) EnsurePrivileged(name string) error {
+	full, etag, err := c.server.GetInstanceFull(name)
+	if err != nil {
+		return err
+	}
+	if full.Config["security.privileged"] == "true" {
+		return nil
+	}
+	put := writableInstance(full)
+	if put.Config == nil {
+		put.Config = api.ConfigMap{}
+	}
+	put.Config["security.privileged"] = "true"
+	return c.updateInstance(name, etag, put)
 }
 
 func (c *IncusClient) ConfigureDefaultNetwork(name string) error {
@@ -820,4 +848,210 @@ func titleCase(s string) string {
 		return s
 	}
 	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+// LaunchLocalImage 从本地镜像存储启动容器 (不从远程镜像服务器拉取)。
+// 用于 sb_lxc build/run 启动已构建的本地镜像。
+func (c *IncusClient) LaunchLocalImage(alias, name string) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	req := api.InstancesPost{
+		Name: name,
+		Type: api.InstanceTypeContainer,
+		InstancePut: api.InstancePut{
+			Config: map[string]string{
+				"security.privileged": "true", // 默认高权限：便于 systemd/网络/设备访问
+			},
+		},
+		Source: api.InstanceSource{
+			Type:  "image",
+			Alias: alias,
+		},
+		Start: false,
+	}
+	op, err := c.server.CreateInstance(req)
+	if err != nil {
+		return err
+	}
+	if err := op.Wait(); err != nil {
+		return err
+	}
+	return c.Start(name)
+}
+
+// PushFile 将字节数据写入容器的指定路径 (覆盖模式)。
+// mode 为八进制权限字符串如 "0644"，为空时默认 0644。UID/GID 保持不变。
+func (c *IncusClient) PushFile(name, path string, content []byte, mode string) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	if mode == "" {
+		mode = "0644"
+	}
+	modeInt, err := strconv.ParseInt(mode, 8, 64)
+	if err != nil {
+		return fmt.Errorf("权限 %q 不是合法的八进制数: %w", mode, err)
+	}
+	args := incus.InstanceFileArgs{
+		Content:   bytes.NewReader(content),
+		UID:       -1,
+		GID:       -1,
+		Mode:      int(modeInt),
+		Type:      "file",
+		WriteMode: "overwrite",
+	}
+	return c.server.CreateInstanceFile(name, path, args)
+}
+
+// ReadFile 读取容器内指定路径的文件内容。
+func (c *IncusClient) ReadFile(name, path string) (string, error) {
+	if err := c.ready(); err != nil {
+		return "", err
+	}
+	reader, _, err := c.server.GetInstanceFile(name, path)
+	if err != nil {
+		return "", err
+	}
+	defer reader.Close()
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// ExecStreaming 在容器内通过 /bin/sh -c 执行命令，stdout/stderr 实时输出到当前进程。
+// extraEnv 会与默认环境合并，使 Incusfile 的 ENV 指令对后续 RUN 生效。
+func (c *IncusClient) ExecStreaming(name, command string, extraEnv map[string]string) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	env := defaultExecEnv()
+	for k, v := range extraEnv {
+		env[k] = v
+	}
+	req := api.InstanceExecPost{
+		Command:     []string{"/bin/sh", "-c", command},
+		Environment: env,
+		WaitForWS:   true,
+		Interactive: false,
+	}
+	op, err := c.server.ExecInstance(name, req, &incus.InstanceExecArgs{
+		Stdin:  strings.NewReader(""),
+		Stdout: os.Stdout,
+		Stderr: os.Stderr,
+	})
+	if err != nil {
+		return err
+	}
+	return op.Wait()
+}
+
+// PublishImage 将容器发布为本地 Incus 镜像，并设置别名。
+// properties 会作为镜像属性存储，供 sb_lxc run 读取以恢复 EXPOSE/DOMAIN/AUTOSTART。
+func (c *IncusClient) PublishImage(containerName, alias string, properties map[string]string) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	req := api.ImagesPost{
+		Source: &api.ImagesPostSource{
+			Type: "container",
+			Name: containerName,
+		},
+	}
+	if properties != nil {
+		req.Properties = properties
+	}
+	op, err := c.server.CreateImage(req, nil)
+	if err != nil {
+		return err
+	}
+	if err := op.Wait(); err != nil {
+		return err
+	}
+	// 从操作元数据获取 fingerprint
+	fingerprint := ""
+	opAPI := op.Get()
+	if opAPI.Metadata != nil {
+		if fp, ok := opAPI.Metadata["fingerprint"].(string); ok {
+			fingerprint = fp
+		}
+	}
+	if fingerprint == "" {
+		// 回退：列出所有镜像，取最新创建的
+		images, err := c.server.GetImages()
+		if err != nil {
+			return fmt.Errorf("发布成功但无法获取镜像 fingerprint: %w", err)
+		}
+		if len(images) == 0 {
+			return fmt.Errorf("发布成功但未找到镜像")
+		}
+		latest := images[0]
+		for _, img := range images {
+			if img.CreatedAt.After(latest.CreatedAt) {
+				latest = img
+			}
+		}
+		fingerprint = latest.Fingerprint
+	}
+	// 创建别名
+	aliasReq := api.ImageAliasesPost{
+		ImageAliasesEntry: api.ImageAliasesEntry{
+			Name: alias,
+			ImageAliasesEntryPut: api.ImageAliasesEntryPut{
+				Target: fingerprint,
+			},
+		},
+	}
+	return c.server.CreateImageAlias(aliasReq)
+}
+
+// ReplaceImageAlias 删除已存在的镜像别名。若旧镜像无其他别名引用，则一并删除孤儿镜像。
+// 用于重新构建同名镜像时保持幂等。别名不存在时静默返回 nil。
+func (c *IncusClient) ReplaceImageAlias(alias string) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	entry, _, err := c.server.GetImageAlias(alias)
+	if err != nil {
+		return nil // 别名不存在，无需处理
+	}
+	// 删除旧别名
+	if err := c.server.DeleteImageAlias(alias); err != nil {
+		return err
+	}
+	// 检查旧镜像是否还有其他别名引用
+	aliases, err := c.server.GetImageAliases()
+	if err != nil {
+		return nil
+	}
+	for _, a := range aliases {
+		if a.Target == entry.Target {
+			return nil // 仍有其他别名引用，保留镜像
+		}
+	}
+	// 无其他引用，删除孤儿镜像
+	op, err := c.server.DeleteImage(entry.Target)
+	if err != nil {
+		return nil
+	}
+	_ = op.Wait()
+	return nil
+}
+
+// GetImageProperties 读取本地镜像 (通过别名) 的属性。
+func (c *IncusClient) GetImageProperties(alias string) (map[string]string, error) {
+	if err := c.ready(); err != nil {
+		return nil, err
+	}
+	entry, _, err := c.server.GetImageAlias(alias)
+	if err != nil {
+		return nil, err
+	}
+	image, _, err := c.server.GetImage(entry.Target)
+	if err != nil {
+		return nil, err
+	}
+	return image.Properties, nil
 }

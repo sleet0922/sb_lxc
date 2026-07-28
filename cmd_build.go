@@ -1,0 +1,608 @@
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// CmdBuild 从 Incusfile 构建镜像并启动容器 (一键编排，类似 docker build + docker run)。
+//
+// 用法:
+//
+//	sb_lxc build [Incusfile]              构建镜像并启动容器 (默认 ./Incusfile)
+//	sb_lxc build --image-only [Incusfile] 只构建镜像，不启动容器
+//	sb_lxc build --name <name> [Incusfile] 覆盖镜像别名/容器名
+//	sb_lxc build --help                   显示帮助
+func CmdBuild(args []string) error {
+	imageOnly := false
+	overrideName := ""
+	incusfilePath := ""
+
+	i := 0
+	for i < len(args) {
+		arg := args[i]
+		switch arg {
+		case "--image-only", "--no-run":
+			imageOnly = true
+			i++
+		case "--name", "-n":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--name 需要参数")
+			}
+			overrideName = args[i+1]
+			i += 2
+		case "--help", "-h":
+			fmt.Print(buildUsage())
+			return nil
+		default:
+			if strings.HasPrefix(arg, "--") {
+				return fmt.Errorf("未知参数: %s (使用 --help 查看用法)", arg)
+			}
+			if incusfilePath != "" {
+				return fmt.Errorf("只能指定一个 Incusfile 路径")
+			}
+			incusfilePath = arg
+			i++
+		}
+	}
+
+	f, err := parseIncusfile(incusfilePath)
+	if err != nil {
+		return err
+	}
+	if overrideName != "" {
+		f.Name = overrideName
+	}
+
+	alias := f.Name
+	if alias == "" {
+		alias = defaultNameFromImage(f.From) + "-built"
+	}
+
+	client := NewIncusClient()
+
+	runCount, copyCount, envCount := 0, 0, 0
+	for _, s := range f.Steps {
+		switch s.Kind {
+		case "RUN":
+			runCount++
+		case "COPY":
+			copyCount++
+		case "ENV":
+			envCount++
+		}
+	}
+
+	fmt.Printf("╭─ Incusfile 构建\n")
+	fmt.Printf("│ 文件:     %s\n", f.Path)
+	fmt.Printf("│ 基础镜像: %s\n", f.From)
+	fmt.Printf("│ 目标镜像: %s\n", alias)
+	fmt.Printf("│ RUN: %d  COPY: %d  ENV: %d  EXPOSE: %d  步骤: %d\n", runCount, copyCount, envCount, len(f.Exposes), len(f.Steps))
+	if f.Domain != "" {
+		fmt.Printf("│ DOMAIN:   %s\n", f.Domain)
+	}
+	if f.Autostart != nil {
+		fmt.Printf("│ AUTOSTART: %s\n", strconv.FormatBool(*f.Autostart))
+	}
+	fmt.Printf("│ 启动容器: %s\n", strconv.FormatBool(!imageOnly))
+	fmt.Printf("╰─\n\n")
+
+	if err := buildImage(client, f, alias); err != nil {
+		return err
+	}
+
+	if imageOnly {
+		fmt.Printf("\n✔ 镜像 %s 构建完成 (未启动容器)\n", alias)
+		fmt.Printf("  使用 'sb_lxc run %s' 启动容器\n", alias)
+		return nil
+	}
+
+	if err := runFromBuiltImage(client, alias, f); err != nil {
+		return err
+	}
+	fmt.Printf("\n✔ 一键构建并启动完成! 镜像=%s  容器=%s\n", alias, f.Name)
+	return nil
+}
+
+func buildUsage() string {
+	return `sb_lxc build - 从 Incusfile 构建镜像并启动容器
+
+用法:
+  sb_lxc build [Incusfile]                构建镜像并启动容器 (默认 ./Incusfile)
+  sb_lxc build --image-only [Incusfile]   只构建镜像
+  sb_lxc build --name <name> [Incusfile]  覆盖镜像/容器名
+
+Incusfile 指令:
+  FROM <image>              基础镜像 (如 debian/12 或 debian:12)
+  NAME <name>               镜像别名 + 容器名
+  RUN <command>             在容器内执行 shell 命令
+  COPY <src> <dst>          从宿主机复制文件/目录到容器
+  ENV <KEY>=<VALUE>         设置环境变量
+  EXPOSE <port>[/<proto>]   声明端口映射 (可多个，空格分隔)
+  DOMAIN <domain>           域名映射
+  AUTOSTART on|off          开机自启动
+
+示例 Incusfile:
+  FROM debian/12
+  NAME my-nginx
+  RUN apt-get update && apt-get install -y nginx
+  RUN echo "daemon off;" >> /etc/nginx/nginx.conf
+  COPY ./index.html /var/www/html/index.html
+  EXPOSE 80/tcp
+  DOMAIN nginx.test
+  AUTOSTART on
+`
+}
+
+// buildImage 执行构建流程：启动临时容器 -> 按顺序执行 Steps -> 发布镜像 -> 清理。
+// Steps 严格按 Incusfile 中的出现顺序执行 (RUN/COPY/ENV)，确保 COPY 依赖的目录
+// 能由前置 RUN 创建。
+func buildImage(client *IncusClient, f *Incusfile, alias string) error {
+	buildName := fmt.Sprintf("sb-lxc-build-%d", time.Now().UnixNano())
+
+	// 清理同名旧别名 (含其引用的孤儿镜像)
+	if err := client.ReplaceImageAlias(alias); err != nil {
+		fmt.Printf("⚠ 清理旧镜像别名失败: %v\n", err)
+	}
+
+	// 启动构建容器
+	fmt.Printf("▶ [1/4] 启动构建容器 %s (镜像 %s) ...\n", buildName, f.From)
+	if err := client.Launch(f.From, buildName); err != nil {
+		return fmt.Errorf("启动构建容器失败: %w", err)
+	}
+
+	// 确保清理临时容器
+	defer func() {
+		fmt.Printf("▶ 清理构建容器 %s ...\n", buildName)
+		_ = client.Stop(buildName)
+		_ = client.Delete(buildName)
+	}()
+
+	// 等待网络就绪 (RUN 中常有 apt-get/apk 等需要网络)
+	fmt.Printf("▶ [2/4] 等待容器网络就绪 ...\n")
+	ip := waitForIP(client, buildName, 30)
+	if ip == "" {
+		fmt.Printf("⚠ 构建容器未获取 IPv4，RUN 命令可能因网络问题失败\n")
+	} else {
+		fmt.Printf("  构建容器 IPv4: %s\n", ip)
+	}
+
+	// 按顺序执行 Steps (RUN/COPY/ENV 严格按 Incusfile 顺序)
+	fmt.Printf("▶ [3/4] 执行 %d 个构建步骤 ...\n", len(f.Steps))
+	runEnv := map[string]string{}
+	var collectedEnvs []EnvSpec
+	contextDir := filepath.Dir(f.Path)
+	total := len(f.Steps)
+	for i, s := range f.Steps {
+		switch s.Kind {
+		case "ENV":
+			fmt.Printf("  [%d/%d] ENV %s=%s\n", i+1, total, s.Env.Key, s.Env.Value)
+			runEnv[s.Env.Key] = s.Env.Value
+			collectedEnvs = append(collectedEnvs, s.Env)
+		case "COPY":
+			fmt.Printf("  [%d/%d] COPY %s -> %s\n", i+1, total, s.Copy.Src, s.Copy.Dst)
+			if err := applyCopy(client, buildName, s.Copy, contextDir); err != nil {
+				return err
+			}
+		case "RUN":
+			fmt.Printf("  [%d/%d] RUN: %s\n", i+1, total, s.Run)
+			if err := client.ExecStreaming(buildName, s.Run, runEnv); err != nil {
+				return fmt.Errorf("RUN 失败: %s\n  %w", s.Run, err)
+			}
+		}
+	}
+
+	// 将所有 ENV 持久化到容器文件系统 (供镜像运行时使用)
+	if len(collectedEnvs) > 0 {
+		if err := applyEnvs(client, buildName, collectedEnvs); err != nil {
+			return err
+		}
+	}
+
+	// 停止构建容器，准备发布镜像
+	fmt.Printf("▶ [4/4] 停止构建容器并发布镜像 ...\n")
+	if err := client.Stop(buildName); err != nil {
+		return fmt.Errorf("停止构建容器失败: %w", err)
+	}
+
+	// 发布为本地镜像
+	fmt.Printf("▶ 发布镜像 %s ...\n", alias)
+	properties := buildImageProperties(f)
+	if err := client.PublishImage(buildName, alias, properties); err != nil {
+		return fmt.Errorf("发布镜像失败: %w", err)
+	}
+	fmt.Printf("✔ 镜像已发布: %s\n", alias)
+	return nil
+}
+
+// buildImageProperties 将 Incusfile 的运行时指令编码为镜像属性，供 sb_lxc run 读取。
+func buildImageProperties(f *Incusfile) map[string]string {
+	p := map[string]string{}
+	if f.Name != "" {
+		p["user.sb_lxc.name"] = f.Name
+	}
+	if len(f.Exposes) > 0 {
+		p["user.sb_lxc.expose"] = exposeString(f.Exposes)
+	}
+	if f.Domain != "" {
+		p["user.sb_lxc.domain"] = f.Domain
+	}
+	if f.Autostart != nil {
+		p["user.sb_lxc.autostart"] = strconv.FormatBool(*f.Autostart)
+	}
+	return p
+}
+
+// runFromBuiltImage 从已构建的镜像启动正式容器，并应用 EXPOSE/DOMAIN/AUTOSTART。
+func runFromBuiltImage(client *IncusClient, alias string, f *Incusfile) error {
+	name := f.Name
+	if name == "" {
+		name = defaultNameFromImage(alias)
+	}
+
+	// 检查同名容器是否已存在
+	if existing, _ := client.GetContainer(name); existing != nil {
+		return fmt.Errorf("容器 %s 已存在，请先卸载或使用 --name 指定其他名称", name)
+	}
+
+	fmt.Printf("▶ 启动容器 %s (镜像 %s) ...\n", name, alias)
+	if err := client.LaunchLocalImage(alias, name); err != nil {
+		return fmt.Errorf("启动容器失败: %w", err)
+	}
+
+	ip := waitForIP(client, name, 30)
+	if ip != "" {
+		warnAutoHostMacvlan(AutoConfigureHostMacvlan(client))
+	} else {
+		fmt.Printf("⚠ 容器未获取 IPv4，端口映射与域名映射将跳过\n")
+	}
+
+	// AUTOSTART
+	if f.Autostart != nil {
+		if err := client.SetBootAutostart(name, *f.Autostart); err != nil {
+			fmt.Printf("⚠ 设置 AUTOSTART 失败: %v\n", err)
+		}
+	}
+
+	// DOMAIN
+	if f.Domain != "" {
+		if err := client.SetDomain(name, f.Domain); err != nil {
+			fmt.Printf("⚠ 设置 DOMAIN 失败: %v\n", err)
+		} else if ip != "" {
+			if err := updateHosts(name, f.Domain, ip); err != nil {
+				fmt.Printf("⚠ 更新 /etc/hosts 失败: %v\n", err)
+			} else {
+				fmt.Printf("✔ 域名映射: %s -> %s\n", f.Domain, ip)
+			}
+		}
+	}
+
+	// EXPOSE -> 端口映射
+	if len(f.Exposes) > 0 && ip != "" {
+		for _, exp := range f.Exposes {
+			if err := client.AddPortMapping(name, exp.Port, exp.Port, exp.Protocol); err != nil {
+				fmt.Printf("⚠ 端口映射 %d/%s 失败: %v\n", exp.Port, exp.Protocol, err)
+			} else {
+				fmt.Printf("✔ 端口映射: %d/%s\n", exp.Port, exp.Protocol)
+			}
+		}
+	}
+
+	return nil
+}
+
+// applyEnvs 将 ENV 指令写入容器的 /etc/environment 和 /etc/profile.d/sb_lxc-env.sh。
+// /etc/environment 由 PAM 在登录会话中加载，profile.d 脚本由 sh 登录 shell 加载。
+func applyEnvs(client *IncusClient, name string, envs []EnvSpec) error {
+	if len(envs) == 0 {
+		return nil
+	}
+	var envBuf bytes.Buffer
+	for _, e := range envs {
+		envBuf.WriteString(fmt.Sprintf("%s=%s\n", e.Key, e.Value))
+	}
+	if err := client.PushFile(name, "/etc/sb_lxc.env", envBuf.Bytes(), "0644"); err != nil {
+		return fmt.Errorf("写入 /etc/sb_lxc.env 失败: %w", err)
+	}
+
+	// profile.d 脚本: 让登录 shell 自动导出变量
+	profile := "#!/bin/sh\n# Generated by sb_lxc build\n[ -f /etc/sb_lxc.env ] && set -a && . /etc/sb_lxc.env && set +a\n"
+	if err := client.PushFile(name, "/etc/profile.d/sb_lxc-env.sh", []byte(profile), "0755"); err != nil {
+		return fmt.Errorf("写入 /etc/profile.d/sb_lxc-env.sh 失败: %w", err)
+	}
+
+	// 追加到 /etc/environment (PAM 读取)
+	existing, _ := client.ReadFile(name, "/etc/environment")
+	var envFile bytes.Buffer
+	envFile.WriteString(existing)
+	if !strings.HasSuffix(existing, "\n") && existing != "" {
+		envFile.WriteString("\n")
+	}
+	for _, e := range envs {
+		envFile.WriteString(fmt.Sprintf("%s=%s\n", e.Key, e.Value))
+	}
+	if err := client.PushFile(name, "/etc/environment", envFile.Bytes(), "0644"); err != nil {
+		return fmt.Errorf("更新 /etc/environment 失败: %w", err)
+	}
+	return nil
+}
+
+// applyCopy 执行单条 COPY 指令，src 相对于 Incusfile 所在目录。
+func applyCopy(client *IncusClient, name string, cp CopySpec, contextDir string) error {
+	src := cp.Src
+	if !filepath.IsAbs(src) {
+		src = filepath.Join(contextDir, src)
+	}
+	src = filepath.Clean(src)
+	return copyToContainer(client, name, src, cp.Dst)
+}
+
+// copyToContainer 将宿主机文件/目录复制到容器。目录会递归复制。
+func copyToContainer(client *IncusClient, name, src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return fmt.Errorf("源文件 %s 不存在: %w", src, err)
+	}
+	if info.IsDir() {
+		return filepath.Walk(src, func(path string, fi os.FileInfo, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if fi.IsDir() {
+				return nil
+			}
+			rel, err := filepath.Rel(src, path)
+			if err != nil {
+				return err
+			}
+			target := filepath.ToSlash(filepath.Join(dst, rel))
+			return pushFileToContainer(client, name, path, target, fi.Mode())
+		})
+	}
+	return pushFileToContainer(client, name, src, dst, info.Mode())
+}
+
+func pushFileToContainer(client *IncusClient, name, srcPath, dstPath string, mode os.FileMode) error {
+	content, err := os.ReadFile(srcPath)
+	if err != nil {
+		return fmt.Errorf("读取 %s 失败: %w", srcPath, err)
+	}
+	modeStr := fmt.Sprintf("%04o", mode.Perm())
+	return client.PushFile(name, dstPath, content, modeStr)
+}
+
+// CmdRun 从已构建的本地镜像启动容器 (类似 docker run)。
+// 读取镜像构建时保存的 EXPOSE/DOMAIN/AUTOSTART 属性并自动应用。
+//
+// 用法:
+//
+//	sb_lxc run <镜像别名> [容器名]
+func CmdRun(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("用法: sb_lxc run <镜像别名> [容器名]")
+	}
+	alias := args[0]
+	name := ""
+	if len(args) >= 2 {
+		name = args[1]
+	}
+
+	client := NewIncusClient()
+
+	// 读取镜像构建时保存的属性
+	props, err := client.GetImageProperties(alias)
+	if err != nil {
+		fmt.Printf("⚠ 读取镜像属性失败: %v (将使用默认配置)\n", err)
+		props = map[string]string{}
+	}
+
+	f := &Incusfile{
+		From:    alias,
+		Exposes: parseExposeString(props["user.sb_lxc.expose"]),
+		Domain:  props["user.sb_lxc.domain"],
+	}
+	if name != "" {
+		f.Name = name
+	} else if v := props["user.sb_lxc.name"]; v != "" {
+		f.Name = v
+	} else {
+		f.Name = defaultNameFromImage(alias)
+	}
+	if v, ok := props["user.sb_lxc.autostart"]; ok {
+		on, _ := strconv.ParseBool(v)
+		f.Autostart = &on
+	}
+
+	fmt.Printf("▶ 从镜像 %s 启动容器 %s\n", alias, f.Name)
+	if len(f.Exposes) > 0 {
+		fmt.Printf("  EXPOSE: %s\n", exposeString(f.Exposes))
+	}
+	if f.Domain != "" {
+		fmt.Printf("  DOMAIN:  %s\n", f.Domain)
+	}
+	if f.Autostart != nil {
+		fmt.Printf("  AUTOSTART: %s\n", strconv.FormatBool(*f.Autostart))
+	}
+	fmt.Println()
+
+	return runFromBuiltImage(client, alias, f)
+}
+
+// CmdImageInit 交互式引导生成 Incusfile。
+//
+// 用法:
+//
+//	sb_lxc image init [输出路径]   默认输出到 ./Incusfile
+func CmdImageInit(args []string) error {
+	fmt.Println("╭─ Incusfile 引导生成器")
+	fmt.Println("│ 类似 Dockerfile，用于一键构建 Incus 容器镜像")
+	fmt.Println("╰─")
+	fmt.Println()
+
+	// FROM
+	fmt.Println("常用基础镜像:")
+	bases := []struct{ Label, Image string }{
+		{"Alpine 3.20", "alpine/3.20"},
+		{"Alpine 3.21", "alpine/3.21"},
+		{"Debian 12 (bookworm)", "debian/12"},
+		{"Debian 13 (trixie)", "debian/13"},
+		{"Ubuntu 22.04 (jammy)", "ubuntu/22.04"},
+		{"Ubuntu 24.04 (noble)", "ubuntu/24.04"},
+		{"Rocky Linux 9", "rockylinux/9"},
+		{"CentOS Stream 9", "centos/stream9"},
+		{"自定义镜像引用", ""},
+	}
+	labels := make([]string, len(bases))
+	for i, b := range bases {
+		labels[i] = b.Label
+	}
+	choice := selectMenu(labels, "选择基础镜像 (↑↓ 选择, Enter 确认, q 退出)")
+	if choice < 0 {
+		return nil
+	}
+	from := bases[choice].Image
+	if from == "" {
+		from = prompt("输入镜像引用 (如 debian/12 或 debian:12): ")
+		if from == "" {
+			return fmt.Errorf("镜像引用不能为空")
+		}
+	}
+
+	// NAME
+	defaultName := defaultNameFromImage(from)
+	name := prompt(fmt.Sprintf("镜像/容器名 (回车默认 %s): ", defaultName))
+	if name == "" {
+		name = defaultName
+	}
+
+	// RUN
+	fmt.Println("\nRUN 命令 (在容器内执行的 shell 命令，每行一条，空行结束):")
+	fmt.Println("  示例: apt-get update && apt-get install -y nginx")
+	var runs []string
+	for {
+		cmd := prompt("  RUN> ")
+		if cmd == "" {
+			break
+		}
+		runs = append(runs, cmd)
+	}
+
+	// COPY
+	var copies []CopySpec
+	fmt.Println("\nCOPY 文件 (从宿主机复制到容器，空行结束):")
+	for {
+		src := prompt("  COPY 源文件 (回车结束): ")
+		if src == "" {
+			break
+		}
+		dst := prompt("  COPY 目标路径: ")
+		if dst == "" {
+			fmt.Println("  ⚠ 目标路径不能为空，跳过")
+			continue
+		}
+		copies = append(copies, CopySpec{Src: src, Dst: dst})
+	}
+
+	// ENV
+	var envs []EnvSpec
+	fmt.Println("\nENV 环境变量 (空行结束):")
+	for {
+		kv := prompt("  ENV KEY=VALUE (回车结束): ")
+		if kv == "" {
+			break
+		}
+		e, err := parseEnvPayload(kv)
+		if err != nil {
+			fmt.Printf("  ⚠ %v\n", err)
+			continue
+		}
+		envs = append(envs, e)
+	}
+
+	// EXPOSE
+	var exposes []PortSpec
+	fmt.Println("\nEXPOSE 端口 (空行结束):")
+	for {
+		p := prompt("  EXPOSE 端口[/协议] (回车结束): ")
+		if p == "" {
+			break
+		}
+		ports, err := parseExposePayload(p)
+		if err != nil {
+			fmt.Printf("  ⚠ %v\n", err)
+			continue
+		}
+		exposes = append(exposes, ports...)
+	}
+
+	// DOMAIN
+	domain := prompt("\nDOMAIN 域名映射 (回车跳过): ")
+
+	// AUTOSTART
+	autostart := ""
+	aChoice := selectMenu([]string{"关闭", "开启"}, "开机自启动 (↑↓ 选择, Enter 确认)")
+	if aChoice == 1 {
+		autostart = "on"
+	}
+
+	// 生成 Incusfile 内容
+	var buf bytes.Buffer
+	buf.WriteString("# Incusfile - sb_lxc 镜像构建描述文件\n")
+	buf.WriteString("# 生成时间: " + time.Now().Format("2006-01-02 15:04:05") + "\n")
+	buf.WriteString("# 用法: sb_lxc build\n\n")
+	buf.WriteString("FROM " + from + "\n")
+	buf.WriteString("NAME " + name + "\n")
+	for _, r := range runs {
+		buf.WriteString("RUN " + r + "\n")
+	}
+	for _, c := range copies {
+		buf.WriteString(fmt.Sprintf("COPY %s %s\n", c.Src, c.Dst))
+	}
+	for _, e := range envs {
+		buf.WriteString(fmt.Sprintf("ENV %s=%s\n", e.Key, e.Value))
+	}
+	if len(exposes) > 0 {
+		parts := make([]string, 0, len(exposes))
+		for _, e := range exposes {
+			parts = append(parts, fmt.Sprintf("%d/%s", e.Port, e.Protocol))
+		}
+		buf.WriteString("EXPOSE " + strings.Join(parts, " ") + "\n")
+	}
+	if domain != "" {
+		buf.WriteString("DOMAIN " + domain + "\n")
+	}
+	if autostart != "" {
+		buf.WriteString("AUTOSTART " + autostart + "\n")
+	}
+
+	// 写入文件
+	path := "Incusfile"
+	if len(args) >= 1 {
+		path = args[0]
+	}
+	if _, err := os.Stat(path); err == nil {
+		confirm := prompt(fmt.Sprintf("⚠ %s 已存在，覆盖? (y/N): ", path))
+		if !strings.EqualFold(confirm, "y") {
+			fmt.Println("已取消")
+			return nil
+		}
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0644); err != nil {
+		return err
+	}
+	fmt.Printf("\n✔ 已生成 %s (%d 字节)\n", path, buf.Len())
+	fmt.Println()
+	fmt.Println("─── 文件内容预览 ───")
+	fmt.Print(buf.String())
+	fmt.Println("─── 预览结束 ───")
+	fmt.Println()
+	fmt.Printf("下一步:\n")
+	fmt.Printf("  sb_lxc build %s        # 构建镜像并启动容器 (一键)\n", path)
+	fmt.Printf("  sb_lxc build --image-only %s   # 只构建镜像\n", path)
+	return nil
+}

@@ -348,13 +348,9 @@ func cmdSetPort(client *IncusClient, ct *Container, args []string) error {
 		return nil
 	}
 	if choice == 0 {
-		spec := prompt("端口映射 (如 8080:80/tcp): ")
-		if spec == "" {
+		hostPort, containerPort, proto, ok := promptPortSpec()
+		if !ok {
 			return nil
-		}
-		hostPort, containerPort, proto, err := parsePortSpec(spec)
-		if err != nil {
-			return err
 		}
 		if err := client.AddPortMapping(name, hostPort, containerPort, proto); err != nil {
 			return err
@@ -394,4 +390,54 @@ func printPortMappings(client *IncusClient, name string) error {
 		}
 	}
 	return nil
+}
+
+// promptPortSpec 三段式引导输入端口映射规格。
+// 返回 (hostPort, containerPort, protocol, ok)，ok=false 表示用户取消。
+//
+// 引导流程:
+//
+//	1. 宿主机端口 (必填, 1-65535)
+//	2. 容器端口   (回车默认 = 宿主机端口)
+//	3. 协议       (回车默认 tcp, 可选 tcp/udp)
+func promptPortSpec() (hostPort, containerPort int, protocol string, ok bool) {
+	fmt.Println()
+	fmt.Println("── 端口映射 (三段式输入) ──")
+
+	// 1. 宿主机端口
+	hostStr := prompt("  宿主机端口 (1-65535): ")
+	hostStr = strings.TrimSpace(hostStr)
+	if hostStr == "" {
+		return 0, 0, "", false
+	}
+	hp, err := strconv.Atoi(hostStr)
+	if err != nil || hp < 1 || hp > 65535 {
+		fmt.Printf("  ✘ 宿主机端口无效: %q (必须是 1-65535 的数字)\n", hostStr)
+		return 0, 0, "", false
+	}
+	hostPort = hp
+
+	// 2. 容器端口 (回车默认 = 宿主机端口)
+	cpStr := prompt(fmt.Sprintf("  容器端口   (回车默认 %d): ", hostPort))
+	cpStr = strings.TrimSpace(cpStr)
+	if cpStr == "" {
+		containerPort = hostPort
+	} else {
+		cp, err := strconv.Atoi(cpStr)
+		if err != nil || cp < 1 || cp > 65535 {
+			fmt.Printf("  ✘ 容器端口无效: %q (必须是 1-65535 的数字)\n", cpStr)
+			return 0, 0, "", false
+		}
+		containerPort = cp
+	}
+
+	// 3. 协议 (回车默认 tcp)
+	protoChoice := selectMenu([]string{"tcp", "udp"}, "  协议 (↑↓ 选择, Enter 确认)")
+	if protoChoice < 0 {
+		return 0, 0, "", false
+	}
+	protocol = []string{"tcp", "udp"}[protoChoice]
+
+	ok = true
+	return
 }

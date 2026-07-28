@@ -6,7 +6,7 @@ import (
 )
 
 // Version 工具版本
-const Version = "1.1.0"
+const Version = "1.3.0"
 
 // MirrorRemote 镜像源在本地的 remote 名称
 const MirrorRemote = "mirror-images"
@@ -61,6 +61,12 @@ func dispatch(cmd string, args []string) error {
 		return CmdInstall(args)
 	case "uninstall", "rm":
 		return CmdUninstall()
+	case "build":
+		return CmdBuild(args)
+	case "run":
+		return CmdRun(args)
+	case "image", "img":
+		return CmdImage(args)
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
@@ -110,21 +116,53 @@ func selectContainer(label string) (string, error) {
 func printUsage() {
 	fmt.Printf(`sb_lxc - Incus 容器管理工具 v%s
 
-用法:
-  sb_lxc list               列出已安装容器
-  sb_lxc start  [容器名]     启动容器 (无参数则交互选择)
-  sb_lxc stop   [容器名]     停止容器 (无参数则交互选择)
-  sb_lxc in     [容器名]     进入容器 (无参数则交互选择)
-  sb_lxc set    [容器名]     容器设置 (无参数则交互选择)
-    sb_lxc set <名> port [规格]           端口映射 (规格如 8080:80/tcp)
-    sb_lxc set <名> port --rm <规格>      取消端口映射
-    sb_lxc set <名> port --list           查看端口映射
-    sb_lxc set <名> domain <域名>         域名映射
-    sb_lxc set <名> autostart [on|off]    开机自启动
-  sb_lxc export [容器名]     导出容器 (无参数则交互选择)
-  sb_lxc import [文件路径] [新容器名]  导入容器 (无参数则选择本地 tar.gz)
-  sb_lxc install            安装新容器 (交互式选择发行版)
-  sb_lxc uninstall           删除容器 (交互式选择)
-  sb_lxc help               显示此帮助
+容器管理:
+  sb_lxc list                 | 列出已安装容器
+  sb_lxc install              | 安装新容器 (交互式选择发行版)
+  sb_lxc uninstall            | 删除容器
+  sb_lxc start   [容器名]     | 启动容器
+  sb_lxc stop    [容器名]     | 停止容器
+  sb_lxc in      [容器名]     | 进入容器 shell
+  sb_lxc export  [容器名]     | 导出容器为 tar.gz
+  sb_lxc import  [文件] [名]  | 从 tar.gz 导入容器
+
+容器设置 (sb_lxc set <容器名> ...):
+  port [规格]                 | 端口映射 (规格如 8080:80/tcp)
+  port --rm <规格>            | 取消端口映射
+  port --list                 | 查看端口映射
+  domain <域名>               | 域名映射 (写入 /etc/hosts)
+  autostart [on|off]          | 开机自启动
+
+镜像构建 (类似 Dockerfile):
+  sb_lxc build [Incusfile]               | 构建镜像并启动容器 (一键)
+  sb_lxc build --image-only [Incusfile]  | 只构建镜像不启动
+  sb_lxc build --name <名> [Incusfile]   | 覆盖镜像/容器名
+  sb_lxc run <镜像> [容器名]             | 从已构建镜像启动容器
+  sb_lxc image init [路径]               | 交互式生成 Incusfile
+
+  Incusfile 指令:
+    FROM <镜像>   NAME <名称>     RUN <命令>
+    COPY <源> <目标>   ENV <K=V>
+    EXPOSE <端口>   DOMAIN <域名>   AUTOSTART on|off
+
+其他:
+  sb_lxc help                 | 显示此帮助
+
+提示: [容器名] 省略时进入交互式选择菜单
 `, Version)
+}
+
+// CmdImage 镜像子命令分发 (目前仅 init)。
+func CmdImage(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("用法: sb_lxc image init [路径]")
+	}
+	switch args[0] {
+	case "init", "new", "create":
+		return CmdImageInit(args[1:])
+	case "build":
+		return CmdBuild(args[1:])
+	default:
+		return fmt.Errorf("未知子命令: sb_lxc image %s (支持: init, build)", args[0])
+	}
 }
