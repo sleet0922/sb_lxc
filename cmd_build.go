@@ -19,6 +19,11 @@ import (
 //	sb_lxc build --name <name> [Incusfile] 覆盖镜像别名/容器名
 //	sb_lxc build --help                   显示帮助
 func CmdBuild(args []string) error {
+	// 子命令: sb_lxc build show - 列出可用于 FROM 的基础镜像
+	if len(args) > 0 && (args[0] == "show" || args[0] == "list" || args[0] == "images") {
+		return showBuildBaseImages()
+	}
+
 	imageOnly := false
 	overrideName := ""
 	incusfilePath := ""
@@ -116,6 +121,7 @@ func buildUsage() string {
   sb_lxc build [Incusfile]                构建镜像并启动容器 (默认 ./Incusfile)
   sb_lxc build --image-only [Incusfile]   只构建镜像
   sb_lxc build --name <name> [Incusfile]  覆盖镜像/容器名
+  sb_lxc build show                       列出可用于 FROM 的基础镜像
 
 Incusfile 指令:
   FROM <image>              基础镜像 (如 debian/12 或 debian:12)
@@ -137,6 +143,102 @@ Incusfile 指令:
   DOMAIN nginx.test
   AUTOSTART on
 `
+}
+
+// showBuildBaseImages 列出远程镜像源中可用于 FROM 指令的基础镜像。
+// 输出按发行版分组，每行一个版本，可直接复制到 Incusfile 的 FROM 行。
+func showBuildBaseImages() error {
+	fmt.Println("正在从镜像源获取可用基础镜像 ...")
+	client := NewIncusClient()
+	groups, err := client.ListImages()
+	if err != nil {
+		return err
+	}
+	if len(groups) == 0 {
+		return fmt.Errorf("未找到可用基础镜像")
+	}
+
+	arch := archName()
+	total := 0
+	for _, g := range groups {
+		total += len(g.Versions)
+	}
+	fmt.Printf("╭─ 可用基础镜像 (架构: %s, 共 %d 个发行版 %d 个版本)\n", arch, len(groups), total)
+	fmt.Println("│ 可直接用于 Incusfile 的 FROM 指令")
+	fmt.Println("│")
+	for _, g := range groups {
+		fmt.Printf("│ %s\n", g.Distro)
+		for _, v := range g.Versions {
+			fmt.Printf("│   FROM %s   # %s\n", v.Image, v.Release)
+		}
+	}
+	fmt.Println("│")
+	fmt.Println("│ 提示: FROM 同时接受 debian/12 与 debian:12 两种写法")
+	fmt.Println("╰─")
+	return nil
+}
+
+// autoConfigureAptMirror 检测容器内 apt 官方源连通性，失败则自动换为清华镜像源。
+// 仅对 Debian/Ubuntu 系容器生效；其他发行版 (Alpine/CentOS 等) 跳过。
+// 这样用户无需在 Incusfile 里手动加 sed 换源命令。
+func autoConfigureAptMirror(client *IncusClient, name string) error {
+	// 检测是否为 Debian/Ubuntu
+	osRelease, err := client.ReadFile(name, "/etc/os-release")
+	if err != nil {
+		return nil // 读不到就跳过，不阻塞构建
+	}
+	if !strings.Contains(osRelease, "ID=debian") && !strings.Contains(osRelease, "ID=ubuntu") {
+		return nil // 非 Debian/Ubuntu，跳过
+	}
+
+	// 测试官方源连通性 (8 秒超时，避免阻塞构建)
+	// 优先用 curl；没有 curl 则用 wget；都没有则不换源 (无法确认是否为网络问题)
+	officialHost := "http://deb.debian.org/"
+	if strings.Contains(osRelease, "ID=ubuntu") {
+		officialHost = "http://archive.ubuntu.com/"
+	}
+
+	// 检测工具可用性：必须有 curl 或 wget 之一才能确认网络问题
+	_, hasToolErr := client.execQuiet(name, "sh", "-c", "command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1")
+	if hasToolErr != nil {
+		// curl 和 wget 都没装，无法确认网络问题，跳过自动换源
+		// (用户可在 Incusfile 里 RUN apt-get update 看实际报错)
+		return nil
+	}
+
+	// 用任意一种工具测试官方源连通性
+	testCmd := fmt.Sprintf(`command -v curl >/dev/null 2>&1 && curl -sI --max-time 8 -o /dev/null -w '%%{http_code}' %s 2>/dev/null | grep -qE '^[23][0-9][0-9]$' ||
+command -v wget >/dev/null 2>&1 && wget -q --timeout=8 --spider %s 2>/dev/null ||
+exit 1`, officialHost, officialHost)
+	_, testErr := client.execQuiet(name, "sh", "-c", testCmd)
+	if testErr == nil {
+		return nil // 官方源可访问，不换源
+	}
+
+	// 已确认官方源不可达，自动换为清华镜像源
+	fmt.Printf("  ⚠ 检测到 apt 官方源不可达，自动换为清华镜像源\n")
+
+	// Debian 12+ 使用 deb822 格式 (/etc/apt/sources.list.d/debian.sources)
+	// Debian 11 及更早使用传统格式 (/etc/apt/sources.list)
+	// Ubuntu 使用 /etc/apt/sources.list
+	// 用 sh 一次性处理所有可能的源文件格式
+	sedScript := `# Debian deb822 格式 (12+)
+if [ -f /etc/apt/sources.list.d/debian.sources ]; then
+	sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources
+	sed -i 's|http://security.debian.org|https://mirrors.tuna.tsinghua.edu.cn/debian-security|g' /etc/apt/sources.list.d/debian.sources
+fi
+# Debian 传统格式 (<=11) 与 Ubuntu
+if [ -f /etc/apt/sources.list ]; then
+	sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list
+	sed -i 's|http://security.debian.org|https://mirrors.tuna.tsinghua.edu.cn/debian-security|g' /etc/apt/sources.list
+	sed -i 's|http://archive.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list
+	sed -i 's|http://security.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list
+fi
+echo "✔ 镜像源已切换为清华源"`
+	if err := client.ExecStreaming(name, sedScript, nil); err != nil {
+		return fmt.Errorf("切换镜像源失败: %w", err)
+	}
+	return nil
 }
 
 // buildImage 执行构建流程：启动临时容器 -> 按顺序执行 Steps -> 发布镜像 -> 清理。
@@ -171,6 +273,14 @@ func buildImage(client *IncusClient, f *Incusfile, alias string) error {
 		fmt.Printf("⚠ 构建容器未获取 IPv4，RUN 命令可能因网络问题失败\n")
 	} else {
 		fmt.Printf("  构建容器 IPv4: %s\n", ip)
+	}
+
+	// 自动配置镜像源：检测到官方源不可达时，自动换为国内镜像源
+	// 适用于 Debian/Ubuntu 系容器 (apt-get 场景)，避免 deb.debian.org 在国内访问超时
+	if ip != "" {
+		if err := autoConfigureAptMirror(client, buildName); err != nil {
+			fmt.Fprintf(os.Stderr, "⚠ 自动配置镜像源失败: %v\n", err)
+		}
 	}
 
 	// 按顺序执行 Steps (RUN/COPY/ENV 严格按 Incusfile 顺序)
@@ -356,15 +466,20 @@ func applyCopy(client *IncusClient, name string, cp CopySpec, contextDir string)
 	}
 	src = filepath.Clean(src)
 	// 路径穿越防护：src 必须位于 contextDir 之内
+	// 注意 src 与 contextDir 都必须转为绝对路径，否则 filepath.Rel 会报错误判。
 	absContext, err := filepath.Abs(contextDir)
 	if err != nil {
 		return fmt.Errorf("解析 contextDir 失败: %w", err)
 	}
-	rel, err := filepath.Rel(absContext, src)
+	absSrc, err := filepath.Abs(src)
+	if err != nil {
+		return fmt.Errorf("解析 src 失败: %w", err)
+	}
+	rel, err := filepath.Rel(absContext, absSrc)
 	if err != nil || strings.HasPrefix(rel, "..") {
 		return fmt.Errorf("COPY 源 %q 位于构建上下文之外 (路径穿越被拒绝)", cp.Src)
 	}
-	return copyToContainer(client, name, src, cp.Dst)
+	return copyToContainer(client, name, absSrc, cp.Dst)
 }
 
 // copyToContainer 将宿主机文件/目录复制到容器。目录会递归复制。

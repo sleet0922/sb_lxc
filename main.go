@@ -6,7 +6,7 @@ import (
 )
 
 // Version 工具版本
-const Version = "1.5.0"
+const Version = "1.5.1"
 
 // MirrorRemote 镜像源在本地的 remote 名称
 const MirrorRemote = "mirror-images"
@@ -154,6 +154,7 @@ func printUsage() {
   sb_lxc build [Incusfile]               | 构建镜像并启动容器 (一键)
   sb_lxc build --image-only [Incusfile]  | 只构建镜像不启动
   sb_lxc build --name <名> [Incusfile]   | 覆盖镜像/容器名
+  sb_lxc build show                      | 列出可用的基础镜像
   sb_lxc run <镜像> [容器名]             | 从已构建镜像启动容器
   sb_lxc image init [路径]               | 交互式生成 Incusfile
 
