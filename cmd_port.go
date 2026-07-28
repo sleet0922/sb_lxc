@@ -397,38 +397,50 @@ func printPortMappings(client *IncusClient, name string) error {
 //
 // 引导流程:
 //
-//	1. 宿主机端口 (必填, 1-65535)
-//	2. 容器端口   (回车默认 = 宿主机端口)
+//	1. 宿主机端口 (必填, 1-65535, 输入错误可重试)
+//	2. 容器端口   (回车默认 = 宿主机端口, 输入错误可重试)
 //	3. 协议       (回车默认 tcp, 可选 tcp/udp)
 func promptPortSpec() (hostPort, containerPort int, protocol string, ok bool) {
 	fmt.Println()
 	fmt.Println("── 端口映射 (三段式输入) ──")
 
-	// 1. 宿主机端口
-	hostStr := prompt("  宿主机端口 (1-65535): ")
-	hostStr = strings.TrimSpace(hostStr)
-	if hostStr == "" {
+	// 1. 宿主机端口 (最多重试 3 次，避免死循环)
+	for attempt := 0; attempt < 3; attempt++ {
+		hostStr := strings.TrimSpace(prompt("  宿主机端口 (1-65535): "))
+		if hostStr == "" {
+			return 0, 0, "", false // 用户主动取消
+		}
+		hp, err := strconv.Atoi(hostStr)
+		if err != nil || hp < 1 || hp > 65535 {
+			fmt.Printf("  ✘ 宿主机端口无效: %q (必须是 1-65535 的数字，请重试)\n", hostStr)
+			continue
+		}
+		hostPort = hp
+		break
+	}
+	if hostPort == 0 {
+		fmt.Println("  ✘ 连续 3 次输入无效，已取消")
 		return 0, 0, "", false
 	}
-	hp, err := strconv.Atoi(hostStr)
-	if err != nil || hp < 1 || hp > 65535 {
-		fmt.Printf("  ✘ 宿主机端口无效: %q (必须是 1-65535 的数字)\n", hostStr)
-		return 0, 0, "", false
-	}
-	hostPort = hp
 
-	// 2. 容器端口 (回车默认 = 宿主机端口)
-	cpStr := prompt(fmt.Sprintf("  容器端口   (回车默认 %d): ", hostPort))
-	cpStr = strings.TrimSpace(cpStr)
-	if cpStr == "" {
-		containerPort = hostPort
-	} else {
+	// 2. 容器端口 (回车默认 = 宿主机端口, 最多重试 3 次)
+	for attempt := 0; attempt < 3; attempt++ {
+		cpStr := strings.TrimSpace(prompt(fmt.Sprintf("  容器端口   (回车默认 %d): ", hostPort)))
+		if cpStr == "" {
+			containerPort = hostPort
+			break
+		}
 		cp, err := strconv.Atoi(cpStr)
 		if err != nil || cp < 1 || cp > 65535 {
-			fmt.Printf("  ✘ 容器端口无效: %q (必须是 1-65535 的数字)\n", cpStr)
-			return 0, 0, "", false
+			fmt.Printf("  ✘ 容器端口无效: %q (必须是 1-65535 的数字，请重试)\n", cpStr)
+			continue
 		}
 		containerPort = cp
+		break
+	}
+	if containerPort == 0 {
+		fmt.Println("  ✘ 连续 3 次输入无效，已取消")
+		return 0, 0, "", false
 	}
 
 	// 3. 协议 (回车默认 tcp)

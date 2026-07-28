@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -12,27 +13,54 @@ func hostsMark(name string) string {
 	return "# sb_lxc:" + name
 }
 
+// atomicWriteHosts 原子写入 /etc/hosts：先写临时文件再 rename，避免写入过程中
+// 进程崩溃或系统断电导致 /etc/hosts 损坏（系统级关键文件，损坏会导致网络解析失效）。
+func atomicWriteHosts(data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir("/etc/hosts"), ".hosts.sb_lxc.*")
+	if err != nil {
+		// 临时文件创建失败时回退为直接写入（保留原有行为，优于完全失败）
+		return os.WriteFile("/etc/hosts", data, 0644)
+	}
+	tmpPath := tmp.Name()
+	// 写入失败也要清理临时文件
+	defer func() { _ = os.Remove(tmpPath) }()
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("写入临时文件失败: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("同步临时文件失败: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("关闭临时文件失败: %w", err)
+	}
+	// 保留 /etc/hosts 原有权限 0644
+	if err := os.Chmod(tmpPath, 0644); err != nil {
+		return fmt.Errorf("设置临时文件权限失败: %w", err)
+	}
+	return os.Rename(tmpPath, "/etc/hosts")
+}
+
 // updateHosts 更新 /etc/hosts：将该容器域名的行更新为新 IP，不存在则追加。
 // 行格式: "<ip> <domain>  # sb_lxc:<容器名>"
+// 幂等性：移除所有该 mark 的旧行后追加新行，避免重复构建产生多行重复条目。
 func updateHosts(name, domain, ip string) error {
 	mark := hostsMark(name)
 	data, _ := os.ReadFile("/etc/hosts")
 	lines := strings.Split(string(data), "\n")
 
-	found := false
-	for i, line := range lines {
-		if strings.Contains(line, mark) {
-			lines[i] = fmt.Sprintf("%s\t%s\t%s", ip, domain, mark)
-			found = true
-			break
+	// 移除所有匹配 mark 的旧行（防止历史重复条目），再追加唯一的新行
+	out := make([]string, 0, len(lines)+1)
+	for _, line := range lines {
+		if !strings.Contains(line, mark) {
+			out = append(out, line)
 		}
 	}
-	if !found {
-		lines = append(lines, fmt.Sprintf("%s\t%s\t%s", ip, domain, mark))
-	}
+	out = append(out, fmt.Sprintf("%s\t%s\t%s", ip, domain, mark))
 
-	out := strings.Join(lines, "\n")
-	return os.WriteFile("/etc/hosts", []byte(out), 0644)
+	return atomicWriteHosts([]byte(strings.Join(out, "\n")))
 }
 
 // removeHostsLine 从 /etc/hosts 移除该容器的映射行。
@@ -47,7 +75,7 @@ func removeHostsLine(name string) error {
 			out = append(out, line)
 		}
 	}
-	return os.WriteFile("/etc/hosts", []byte(strings.Join(out, "\n")), 0644)
+	return atomicWriteHosts([]byte(strings.Join(out, "\n")))
 }
 
 // waitForIP 轮询容器 IPv4，最多等待 maxWait 秒。

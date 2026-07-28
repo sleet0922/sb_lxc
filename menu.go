@@ -16,6 +16,11 @@ var stdinReader = bufio.NewReader(os.Stdin)
 // selectMenu 交互式上下键选择菜单，返回选中索引；-1 表示取消。
 // 支持：↑↓/jk 选择、Enter 确认、q/Ctrl+C 退出、数字键直选。
 func selectMenu(options []string, prompt string) int {
+	// 空选项列表防护：避免调用方对空列表索引导致 panic
+	if len(options) == 0 {
+		return -1
+	}
+
 	fd := int(os.Stdin.Fd())
 	old, err := makeRaw(fd)
 	if err != nil {
@@ -25,12 +30,18 @@ func selectMenu(options []string, prompt string) int {
 	defer restoreTerm(fd, old)
 
 	// 兜底：若 SIGINT/SIGTERM 来自外部（如 kill -INT），确保恢复终端后再退出
+	// 使用 done channel 防止 goroutine 泄漏：selectMenu 返回时关闭 done，goroutine 随即退出
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		<-sigCh
-		restoreTerm(fd, old)
-		os.Exit(130)
+		select {
+		case <-sigCh:
+			restoreTerm(fd, old)
+			os.Exit(130)
+		case <-done:
+		}
 	}()
 	defer signal.Stop(sigCh)
 

@@ -222,7 +222,8 @@ exit 1`, officialHost, officialHost)
 	// Debian 11 及更早使用传统格式 (/etc/apt/sources.list)
 	// Ubuntu 使用 /etc/apt/sources.list
 	// 用 sh 一次性处理所有可能的源文件格式
-	sedScript := `# Debian deb822 格式 (12+)
+	sedScript := `set -e
+# Debian deb822 格式 (12+)
 if [ -f /etc/apt/sources.list.d/debian.sources ]; then
 	sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources
 	sed -i 's|http://security.debian.org|https://mirrors.tuna.tsinghua.edu.cn/debian-security|g' /etc/apt/sources.list.d/debian.sources
@@ -259,11 +260,17 @@ func buildImage(client *IncusClient, f *Incusfile, alias string) error {
 		return fmt.Errorf("启动构建容器失败: %w", err)
 	}
 
-	// 确保清理临时容器
+	// 确保清理临时容器：先尝试优雅停止，失败则强制停止，确保 Delete 不会因容器仍在运行而失败
 	defer func() {
 		fmt.Printf("▶ 清理构建容器 %s ...\n", buildName)
-		_ = client.Stop(buildName)
-		_ = client.Delete(buildName)
+		if err := client.Stop(buildName); err != nil {
+			// 优雅停止失败（容器挂起/超时），强制停止以保证后续 Delete 成功
+			fmt.Fprintf(os.Stderr, "  ⚠ 优雅停止失败 (%v)，强制停止 ...\n", err)
+			_ = client.StopForce(buildName)
+		}
+		if err := client.Delete(buildName); err != nil {
+			fmt.Fprintf(os.Stderr, "  ⚠ 删除构建容器失败: %v\n", err)
+		}
 	}()
 
 	// 等待网络就绪 (RUN 中常有 apt-get/apk 等需要网络)

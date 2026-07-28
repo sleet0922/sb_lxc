@@ -84,10 +84,27 @@ func parseIncusfile(path string) (*Incusfile, error) {
 			logical = append(logical, logicalLine{no: startNo, text: cur})
 			continue
 		}
-		// 合并后续以 \ 结尾的行
-		for strings.HasSuffix(cur, "\\") && i+1 < len(rawLines) {
-			cur = strings.TrimSuffix(cur, "\\") + " " + strings.TrimLeft(rawLines[i+1], " \t")
+		// 合并后续以 \ 结尾的行 (容忍反斜杠后的尾随空白，跳过续行中的注释/空行)
+		for {
+			trimmedCur := strings.TrimRight(cur, " \t")
+			if !strings.HasSuffix(trimmedCur, "\\") || i+1 >= len(rawLines) {
+				break
+			}
+			cur = strings.TrimSuffix(trimmedCur, "\\")
 			i++
+			// 跳过续行中的注释行和空行 (与 Dockerfile 行为一致：注释在续行中被移除)
+			for i < len(rawLines) {
+				next := strings.TrimSpace(rawLines[i])
+				if next == "" || strings.HasPrefix(next, "#") {
+					i++
+					continue
+				}
+				break
+			}
+			if i >= len(rawLines) {
+				break
+			}
+			cur += " " + strings.TrimLeft(rawLines[i], " \t")
 		}
 		logical = append(logical, logicalLine{no: startNo, text: cur})
 	}

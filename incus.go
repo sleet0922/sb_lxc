@@ -451,6 +451,19 @@ func (c *IncusClient) Stop(name string) error {
 	return op.Wait()
 }
 
+// StopForce 强制停止容器（Force=true, Timeout=0），用于构建容器的可靠清理。
+// 即使容器内进程挂起或 Stop 超时，ForceStop 也能确保容器停止，避免后续 Delete 失败导致资源泄漏。
+func (c *IncusClient) StopForce(name string) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	op, err := c.server.UpdateInstanceState(name, api.InstanceStatePut{Action: "stop", Timeout: 0, Force: true}, "")
+	if err != nil {
+		return err
+	}
+	return op.Wait()
+}
+
 func (c *IncusClient) Delete(name string) error {
 	if err := c.ready(); err != nil {
 		return err
@@ -534,12 +547,22 @@ func (c *IncusClient) Launch(imageRef, name string) error {
 	if err := c.ready(); err != nil {
 		return err
 	}
-	// 规范化镜像引用：debian:12 -> debian/12，与镜像源 alias 一致
-	alias := normalizeImageRef(imageRef)
 	// 去掉可能的 remote 前缀（如 mirror-images:debian/12 -> debian/12）
+	// 必须在 normalizeImageRef 之前执行：否则 normalizeImageRef 会把
+	// "mirror-images:debian:12" 错误转换为 "mirror-images/debian:12"，
+	// 导致后续 remote 前缀剥离错误地截取为 "12"。
+	// 判断依据：: 前部分不含 / 且 : 后部分包含 / 或 : (即 after 是完整镜像引用而非单纯 tag)
+	alias := imageRef
 	if idx := strings.IndexByte(alias, ':'); idx >= 0 {
-		alias = alias[idx+1:]
+		before := alias[:idx]
+		after := alias[idx+1:]
+		if !strings.Contains(before, "/") && after != "" &&
+			(strings.Contains(after, "/") || strings.Contains(after, ":")) {
+			alias = after
+		}
 	}
+	// 规范化镜像引用：debian:12 -> debian/12，与镜像源 alias 一致
+	alias = normalizeImageRef(alias)
 	req := api.InstancesPost{
 		Name: name,
 		Type: api.InstanceTypeContainer,
