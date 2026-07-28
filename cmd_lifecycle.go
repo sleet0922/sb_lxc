@@ -37,6 +37,13 @@ func CmdStart(name string) error {
 		warnAutoHostMacvlan(AutoConfigureHostMacvlan(client))
 	}
 
+	// 刷新端口映射的 connect 地址，应对 DHCP 重新分配导致容器 IP 变化的场景。
+	if refreshed, rerr := client.RefreshPortMappings(name); rerr != nil {
+		fmt.Printf("⚠ 刷新端口映射失败: %v\n", rerr)
+	} else if refreshed > 0 {
+		fmt.Printf("✔ 已刷新 %d 条端口映射的容器 IP (%s)\n", refreshed, ip)
+	}
+
 	// 检查域名映射，有则更新 /etc/hosts。
 	if domain == "" {
 		return nil

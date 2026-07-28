@@ -32,6 +32,8 @@ func CmdSet(args []string) error {
 				return applyDomain(client, ct, args[2])
 			}
 			return removeDomain(client, ct)
+		case "port", "ports", "forward", "fwd":
+			return cmdSetPort(client, ct, args[2:])
 		case "autostart":
 			on := true
 			if len(args) >= 3 && (args[2] == "off" || args[2] == "false" || args[2] == "0") {
@@ -52,12 +54,15 @@ func CmdSet(args []string) error {
 	options := []string{
 		"域名映射",
 		"取消域名映射",
+		"端口映射",
+		"取消端口映射",
 		"开机自启动",
 		"关闭开机自启动",
 	}
 
-	fmt.Printf("容器: %s  (状态: %s, 自启: %s, 域名: %s)\n",
-		name, strings.ToLower(ct.Status), autostartBadge(ct.Autostart()), orNA(ct.Domain()))
+	fmt.Printf("容器: %s  (状态: %s, 自启: %s, 域名: %s, 端口: %s)\n",
+		name, strings.ToLower(ct.Status), autostartBadge(ct.Autostart()), orNA(ct.Domain()),
+		portSummary(ct.PortMappings()))
 	choice := selectMenu(options, "选择操作 (↑↓ 选择, Enter 确认, q 退出)")
 	if choice < 0 {
 		return nil
@@ -70,16 +75,49 @@ func CmdSet(args []string) error {
 	case 1:
 		return removeDomain(client, ct)
 	case 2:
+		// 进入端口映射交互菜单
+		return cmdSetPort(client, ct, nil)
+	case 3:
+		// 直接进入“取消端口映射”流程：列出当前映射并选择移除
+		return cmdSetPortRemoveInteractive(client, ct)
+	case 4:
 		if err := client.SetBootAutostart(name, true); err != nil {
 			return err
 		}
 		fmt.Printf("✔ 容器 %s 已开启开机自启动\n", name)
-	case 3:
+	case 5:
 		if err := client.SetBootAutostart(name, false); err != nil {
 			return err
 		}
 		fmt.Printf("✔ 容器 %s 已关闭开机自启动\n", name)
 	}
+	return nil
+}
+
+// cmdSetPortRemoveInteractive 直接进入“取消端口映射”流程：列出当前映射并选择移除。
+func cmdSetPortRemoveInteractive(client *IncusClient, ct *Container) error {
+	mappings := ct.PortMappings()
+	if len(mappings) == 0 {
+		fmt.Println("该容器未配置端口映射。")
+		return nil
+	}
+	options := make([]string, 0, len(mappings))
+	for _, m := range mappings {
+		label := fmt.Sprintf("%d/%s", m.HostPort, m.Protocol)
+		if m.HostPort != m.ContainerPort {
+			label = fmt.Sprintf("%d/%s -> %d", m.HostPort, m.Protocol, m.ContainerPort)
+		}
+		options = append(options, label)
+	}
+	choice := selectMenu(options, "选择要移除的端口映射 (↑↓ 选择, Enter 确认, q 退出)")
+	if choice < 0 || choice >= len(mappings) {
+		return nil
+	}
+	m := mappings[choice]
+	if err := client.RemovePortMapping(ct.Name, m.HostPort, m.Protocol); err != nil {
+		return err
+	}
+	fmt.Printf("✔ 已移除端口映射 %d/%s\n", m.HostPort, m.Protocol)
 	return nil
 }
 

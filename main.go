@@ -20,6 +20,9 @@ func main() {
 	client.EnsureMirrorRemote()
 	warnAutoHostMacvlan(client.EnsureDefaultMacvlanProfile())
 
+	// 自动清理未被任何容器/profile 引用的 Incus 托管 bridge (如默认 incusbr0)
+	_ = client.AutoCleanupUnusedBridges()
+
 	// 每次启动程序都自动刷新宿主机侧 macvlan shim 与当前运行容器的 /32 路由。
 	warnAutoHostMacvlan(AutoConfigureHostMacvlan(client))
 
@@ -113,6 +116,11 @@ func printUsage() {
   sb_lxc stop   [容器名]     停止容器 (无参数则交互选择)
   sb_lxc in     [容器名]     进入容器 (无参数则交互选择)
   sb_lxc set    [容器名]     容器设置 (无参数则交互选择)
+    sb_lxc set <名> port [规格]           端口映射 (规格如 8080:80/tcp)
+    sb_lxc set <名> port --rm <规格>      取消端口映射
+    sb_lxc set <名> port --list           查看端口映射
+    sb_lxc set <名> domain <域名>         域名映射
+    sb_lxc set <名> autostart [on|off]    开机自启动
   sb_lxc export [容器名]     导出容器 (无参数则交互选择)
   sb_lxc import [文件路径] [新容器名]  导入容器 (无参数则选择本地 tar.gz)
   sb_lxc install            安装新容器 (交互式选择发行版)

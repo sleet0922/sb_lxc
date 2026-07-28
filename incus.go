@@ -284,6 +284,73 @@ func (c *IncusClient) updateInstance(name string, etag string, put api.InstanceP
 // the SimpleStreams server directly, so no local Incus remote is needed.
 func (c *IncusClient) EnsureMirrorRemote() {}
 
+// AutoCleanupUnusedBridges 自动删除未被任何容器或 profile 引用的 Incus 托管 bridge 网络。
+// sb_lxc 使用 macvlan 网络，Incus admin init 默认创建的 incusbr0 在此场景下无用，
+// 还会占用 53 端口(dnsmasq)与网段。删除是幂等的：已不存在则跳过。
+// 不删除非托管(external) bridge，避免误删用户手动创建的网桥。
+func (c *IncusClient) AutoCleanupUnusedBridges() error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	networks, err := c.server.GetNetworks()
+	if err != nil {
+		return fmt.Errorf("获取网络列表失败: %w", err)
+	}
+
+	// 收集所有容器与 profile 中 NIC 设备引用的 network / parent
+	used := map[string]bool{}
+	instances, err := c.server.GetInstancesFull(api.InstanceTypeContainer)
+	if err == nil {
+		for i := range instances {
+			for _, devs := range []map[string]map[string]string{instances[i].Devices, instances[i].ExpandedDevices} {
+				for _, dev := range devs {
+					if dev["type"] != "nic" {
+						continue
+					}
+					if n := dev["network"]; n != "" {
+						used[n] = true
+					}
+					if p := dev["parent"]; p != "" {
+						used[p] = true
+					}
+				}
+			}
+		}
+	}
+	profiles, err := c.server.GetProfiles()
+	if err == nil {
+		for _, p := range profiles {
+			for _, dev := range p.Devices {
+				if dev["type"] != "nic" {
+					continue
+				}
+				if n := dev["network"]; n != "" {
+					used[n] = true
+				}
+				if p := dev["parent"]; p != "" {
+					used[p] = true
+				}
+			}
+		}
+	}
+
+	// 删除所有 Incus 托管且未被引用的 bridge 类型网络
+	for _, n := range networks {
+		if n.Type != "bridge" || !n.Managed {
+			continue
+		}
+		if used[n.Name] {
+			continue
+		}
+		if err := c.server.DeleteNetwork(n.Name); err != nil {
+			fmt.Fprintf(os.Stderr, "⚠ 删除未使用网桥 %s 失败: %v\n", n.Name, err)
+			continue
+		}
+		fmt.Printf("✔ 已删除未使用的 Incus 网桥: %s\n", n.Name)
+	}
+	return nil
+}
+
 func (c *IncusClient) EnsureDefaultMacvlanProfile() error {
 	if err := c.ready(); err != nil {
 		return err
