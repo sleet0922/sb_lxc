@@ -143,7 +143,8 @@ Incusfile 指令:
 // Steps 严格按 Incusfile 中的出现顺序执行 (RUN/COPY/ENV)，确保 COPY 依赖的目录
 // 能由前置 RUN 创建。
 func buildImage(client *IncusClient, f *Incusfile, alias string) error {
-	buildName := fmt.Sprintf("sb-lxc-build-%d", time.Now().UnixNano())
+	// 构建容器名加入 PID 与随机后缀，避免并发构建碰撞
+	buildName := fmt.Sprintf("sb-lxc-build-%d-%d", os.Getpid(), time.Now().UnixNano())
 
 	// 清理同名旧别名 (含其引用的孤儿镜像)
 	if err := client.ReplaceImageAlias(alias); err != nil {
@@ -298,6 +299,7 @@ func runFromBuiltImage(client *IncusClient, alias string, f *Incusfile) error {
 
 // applyEnvs 将 ENV 指令写入容器的 /etc/environment 和 /etc/profile.d/sb_lxc-env.sh。
 // /etc/environment 由 PAM 在登录会话中加载，profile.d 脚本由 sh 登录 shell 加载。
+// 幂等性：/etc/sb_lxc.env 为覆盖式写入；/etc/environment 先移除 sb_lxc 管理的行再追加，避免重复构建污染。
 func applyEnvs(client *IncusClient, name string, envs []EnvSpec) error {
 	if len(envs) == 0 {
 		return nil
@@ -316,12 +318,25 @@ func applyEnvs(client *IncusClient, name string, envs []EnvSpec) error {
 		return fmt.Errorf("写入 /etc/profile.d/sb_lxc-env.sh 失败: %w", err)
 	}
 
-	// 追加到 /etc/environment (PAM 读取)
+	// /etc/environment (PAM 读取)：移除 sb_lxc 已管理的 KEY= 行（幂等），再追加本次的
+	envKeys := map[string]bool{}
+	for _, e := range envs {
+		envKeys[e.Key+"="] = true
+	}
 	existing, _ := client.ReadFile(name, "/etc/environment")
 	var envFile bytes.Buffer
-	envFile.WriteString(existing)
-	if !strings.HasSuffix(existing, "\n") && existing != "" {
-		envFile.WriteString("\n")
+	for _, line := range strings.Split(existing, "\n") {
+		trimmed := strings.TrimSpace(line)
+		skip := false
+		for prefix := range envKeys {
+			if strings.HasPrefix(trimmed, prefix) {
+				skip = true
+				break
+			}
+		}
+		if !skip && trimmed != "" {
+			envFile.WriteString(line + "\n")
+		}
 	}
 	for _, e := range envs {
 		envFile.WriteString(fmt.Sprintf("%s=%s\n", e.Key, e.Value))
@@ -333,28 +348,47 @@ func applyEnvs(client *IncusClient, name string, envs []EnvSpec) error {
 }
 
 // applyCopy 执行单条 COPY 指令，src 相对于 Incusfile 所在目录。
+// 安全约束：解析后的 src 必须位于 contextDir 之内，拒绝路径穿越 (如 ../../etc/passwd)。
 func applyCopy(client *IncusClient, name string, cp CopySpec, contextDir string) error {
 	src := cp.Src
 	if !filepath.IsAbs(src) {
 		src = filepath.Join(contextDir, src)
 	}
 	src = filepath.Clean(src)
+	// 路径穿越防护：src 必须位于 contextDir 之内
+	absContext, err := filepath.Abs(contextDir)
+	if err != nil {
+		return fmt.Errorf("解析 contextDir 失败: %w", err)
+	}
+	rel, err := filepath.Rel(absContext, src)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return fmt.Errorf("COPY 源 %q 位于构建上下文之外 (路径穿越被拒绝)", cp.Src)
+	}
 	return copyToContainer(client, name, src, cp.Dst)
 }
 
 // copyToContainer 将宿主机文件/目录复制到容器。目录会递归复制。
+// 不跟随符号链接，避免绕过路径穿越校验。
 func copyToContainer(client *IncusClient, name, src, dst string) error {
-	info, err := os.Stat(src)
+	info, err := os.Lstat(src)
 	if err != nil {
 		return fmt.Errorf("源文件 %s 不存在: %w", src, err)
 	}
 	if info.IsDir() {
-		return filepath.Walk(src, func(path string, fi os.FileInfo, walkErr error) error {
+		return filepath.WalkDir(src, func(path string, d os.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return walkErr
 			}
-			if fi.IsDir() {
+			if d.IsDir() {
 				return nil
+			}
+			// 拒绝符号链接，防止穿越
+			if d.Type()&os.ModeSymlink != 0 {
+				return fmt.Errorf("COPY 不支持符号链接: %s", path)
+			}
+			fi, err := d.Info()
+			if err != nil {
+				return err
 			}
 			rel, err := filepath.Rel(src, path)
 			if err != nil {
@@ -363,6 +397,10 @@ func copyToContainer(client *IncusClient, name, src, dst string) error {
 			target := filepath.ToSlash(filepath.Join(dst, rel))
 			return pushFileToContainer(client, name, path, target, fi.Mode())
 		})
+	}
+	// 源是符号链接则拒绝
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("COPY 不支持符号链接: %s", src)
 	}
 	return pushFileToContainer(client, name, src, dst, info.Mode())
 }

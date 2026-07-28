@@ -121,11 +121,11 @@ func parseIncusfile(path string) (*Incusfile, error) {
 			}
 			f.Steps = append(f.Steps, BuildStep{Kind: "RUN", Run: payload})
 		case "COPY":
-			parts := strings.Fields(payload)
-			if len(parts) != 2 {
-				return nil, fmt.Errorf("line %d: COPY 用法: COPY <src> <dst>", lineNo)
+			src, dst, err := parseCopyPayload(payload)
+			if err != nil {
+				return nil, fmt.Errorf("line %d: %w", lineNo, err)
 			}
-			f.Steps = append(f.Steps, BuildStep{Kind: "COPY", Copy: CopySpec{Src: parts[0], Dst: parts[1]}})
+			f.Steps = append(f.Steps, BuildStep{Kind: "COPY", Copy: CopySpec{Src: src, Dst: dst}})
 		case "ENV":
 			kv, err := parseEnvPayload(payload)
 			if err != nil {
@@ -177,6 +177,49 @@ func normalizeImageRef(ref string) string {
 		return strings.Replace(ref, ":", "/", 1)
 	}
 	return ref
+}
+
+// parseCopyPayload 解析 COPY 指令的 payload，支持引号包裹的含空格路径。
+// COPY ./index.html /var/www/html/index.html
+// COPY "my file.txt" "/path with spaces/file.txt"
+func parseCopyPayload(payload string) (src, dst string, err error) {
+	fields, err := shellSplit(payload)
+	if err != nil {
+		return "", "", fmt.Errorf("COPY 用法: COPY <src> <dst>: %w", err)
+	}
+	if len(fields) != 2 {
+		return "", "", fmt.Errorf("COPY 用法: COPY <src> <dst> (得到 %d 个参数)", len(fields))
+	}
+	return fields[0], fields[1], nil
+}
+
+// shellSplit 按空白切分字符串，但支持双引号包裹的含空格字段。
+// 例如: shellSplit(`a "b c" d`) -> ["a", "b c", "d"]
+func shellSplit(s string) ([]string, error) {
+	var result []string
+	var cur strings.Builder
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '"':
+			inQuote = !inQuote
+		case (c == ' ' || c == '\t') && !inQuote:
+			if cur.Len() > 0 {
+				result = append(result, cur.String())
+				cur.Reset()
+			}
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	if inQuote {
+		return nil, fmt.Errorf("未闭合的引号")
+	}
+	if cur.Len() > 0 {
+		result = append(result, cur.String())
+	}
+	return result, nil
 }
 
 func parseEnvPayload(payload string) (EnvSpec, error) {

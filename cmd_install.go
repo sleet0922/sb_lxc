@@ -12,9 +12,8 @@ func CmdInstall(args []string) error {
 
 	if len(args) >= 1 {
 		imageRef := args[0]
-		if !strings.Contains(imageRef, ":") {
-			imageRef = MirrorRemote + ":" + imageRef
-		}
+		// 规范化镜像引用：debian:12 -> debian/12，统一内部处理
+		imageRef = normalizeImageRef(imageRef)
 		name := ""
 		if len(args) >= 2 {
 			name = args[1]
@@ -71,7 +70,8 @@ func CmdInstall(args []string) error {
 		name = defaultName
 	}
 
-	imageRef := MirrorRemote + ":" + version.Image
+	// version.Image 已是 alias 形式（如 debian/12），Launch 内部会处理
+	imageRef := version.Image
 	fmt.Printf("\n正在安装 %s %s (%s) ...\n", group.Distro, version.Release, imageRef)
 	if err := client.Launch(imageRef, name); err != nil {
 		return err
@@ -88,7 +88,9 @@ func CmdInstall(args []string) error {
 
 // defaultNameFromImage 由镜像引用生成合法容器名。
 // debian/bookworm -> debian-bookworm
+// debian:12 -> debian-12
 func defaultNameFromImage(image string) string {
 	s := strings.ReplaceAll(image, "/", "-")
+	s = strings.ReplaceAll(s, ":", "-")
 	return strings.ToLower(s)
 }

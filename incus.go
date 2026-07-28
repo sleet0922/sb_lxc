@@ -288,6 +288,7 @@ func (c *IncusClient) EnsureMirrorRemote() {}
 // sb_lxc 使用 macvlan 网络，Incus admin init 默认创建的 incusbr0 在此场景下无用，
 // 还会占用 53 端口(dnsmasq)与网段。删除是幂等的：已不存在则跳过。
 // 不删除非托管(external) bridge，避免误删用户手动创建的网桥。
+// 安全约束：容器/profile 列表查询失败时直接返回错误，绝不执行删除，避免误删在用网桥。
 func (c *IncusClient) AutoCleanupUnusedBridges() error {
 	if err := c.ready(); err != nil {
 		return err
@@ -297,30 +298,16 @@ func (c *IncusClient) AutoCleanupUnusedBridges() error {
 		return fmt.Errorf("获取网络列表失败: %w", err)
 	}
 
-	// 收集所有容器与 profile 中 NIC 设备引用的 network / parent
+	// 收集所有容器与 profile 中 NIC 设备引用的 network / parent。
+	// 任一查询失败都必须中止：否则 used 为空会误删在用网桥。
 	used := map[string]bool{}
 	instances, err := c.server.GetInstancesFull(api.InstanceTypeContainer)
-	if err == nil {
-		for i := range instances {
-			for _, devs := range []map[string]map[string]string{instances[i].Devices, instances[i].ExpandedDevices} {
-				for _, dev := range devs {
-					if dev["type"] != "nic" {
-						continue
-					}
-					if n := dev["network"]; n != "" {
-						used[n] = true
-					}
-					if p := dev["parent"]; p != "" {
-						used[p] = true
-					}
-				}
-			}
-		}
+	if err != nil {
+		return fmt.Errorf("查询容器列表失败，跳过网桥清理以避免误删: %w", err)
 	}
-	profiles, err := c.server.GetProfiles()
-	if err == nil {
-		for _, p := range profiles {
-			for _, dev := range p.Devices {
+	for i := range instances {
+		for _, devs := range []map[string]map[string]string{instances[i].Devices, instances[i].ExpandedDevices} {
+			for _, dev := range devs {
 				if dev["type"] != "nic" {
 					continue
 				}
@@ -330,6 +317,23 @@ func (c *IncusClient) AutoCleanupUnusedBridges() error {
 				if p := dev["parent"]; p != "" {
 					used[p] = true
 				}
+			}
+		}
+	}
+	profiles, err := c.server.GetProfiles()
+	if err != nil {
+		return fmt.Errorf("查询 profile 列表失败，跳过网桥清理以避免误删: %w", err)
+	}
+	for _, p := range profiles {
+		for _, dev := range p.Devices {
+			if dev["type"] != "nic" {
+				continue
+			}
+			if n := dev["network"]; n != "" {
+				used[n] = true
+			}
+			if p := dev["parent"]; p != "" {
+				used[p] = true
 			}
 		}
 	}
@@ -527,9 +531,11 @@ func (c *IncusClient) Launch(imageRef, name string) error {
 	if err := c.ready(); err != nil {
 		return err
 	}
-	alias := imageRef
-	if idx := strings.IndexByte(imageRef, ':'); idx >= 0 {
-		alias = imageRef[idx+1:]
+	// 规范化镜像引用：debian:12 -> debian/12，与镜像源 alias 一致
+	alias := normalizeImageRef(imageRef)
+	// 去掉可能的 remote 前缀（如 mirror-images:debian/12 -> debian/12）
+	if idx := strings.IndexByte(alias, ':'); idx >= 0 {
+		alias = alias[idx+1:]
 	}
 	req := api.InstancesPost{
 		Name: name,
@@ -792,7 +798,7 @@ func (c *IncusClient) ListImages() ([]DistroGroup, error) {
 	if err != nil {
 		return nil, fmt.Errorf("获取镜像列表失败: %w", err)
 	}
-	const arch = "x86_64"
+	arch := archName() // 动态获取当前主机架构，支持 amd64/arm64
 	allowedDistros := map[string]bool{"alpine": true, "centos": true, "debian": true, "nixos": true, "ubuntu": true, "oracle": true, "rockylinux": true}
 	grouped := map[string]map[string]string{}
 	distroOrder := []string{}

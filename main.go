@@ -6,7 +6,7 @@ import (
 )
 
 // Version 工具版本
-const Version = "1.4.0"
+const Version = "1.5.0"
 
 // MirrorRemote 镜像源在本地的 remote 名称
 const MirrorRemote = "mirror-images"
@@ -15,17 +15,6 @@ const MirrorRemote = "mirror-images"
 const MirrorURL = "https://images.linuxcontainers.org/"
 
 func main() {
-	// 每次启动都先确保只保留清华镜像源（移除官方 images 源与旧 mirror-images）
-	client := NewIncusClient()
-	client.EnsureMirrorRemote()
-	warnAutoHostMacvlan(client.EnsureDefaultMacvlanProfile())
-
-	// 自动清理未被任何容器/profile 引用的 Incus 托管 bridge (如默认 incusbr0)
-	_ = client.AutoCleanupUnusedBridges()
-
-	// 每次启动程序都自动刷新宿主机侧 macvlan shim 与当前运行容器的 /32 路由。
-	warnAutoHostMacvlan(AutoConfigureHostMacvlan(client))
-
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(0)
@@ -34,10 +23,36 @@ func main() {
 	cmd := os.Args[1]
 	args := os.Args[2:]
 
+	// 轻量命令：跳过启动期网络探测，保证 help/version 等即时响应
+	if isLightweightCommand(cmd) {
+		if err := dispatch(cmd, args); err != nil {
+			fmt.Fprintf(os.Stderr, "✘ %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// 重量级命令：执行启动期副作用（网络探测、网桥清理、macvlan shim 维护）
+	client := NewIncusClient()
+	client.EnsureMirrorRemote()
+	warnAutoHostMacvlan(client.EnsureDefaultMacvlanProfile())
+	_ = client.AutoCleanupUnusedBridges()
+	warnAutoHostMacvlan(AutoConfigureHostMacvlan(client))
+
 	if err := dispatch(cmd, args); err != nil {
 		fmt.Fprintf(os.Stderr, "✘ %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// isLightweightCommand 判断命令是否为轻量级（无需网络探测）。
+// help/version 等只读命令跳过启动期副作用，保证即时响应。
+func isLightweightCommand(cmd string) bool {
+	switch cmd {
+	case "help", "-h", "--help", "--version", "-v", "version":
+		return true
+	}
+	return false
 }
 
 // dispatch 命令分发
@@ -70,9 +85,11 @@ func dispatch(cmd string, args []string) error {
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
+	case "--version", "-v", "version":
+		fmt.Printf("sb_lxc v%s\n", Version)
+		return nil
 	default:
-		printUsage()
-		return fmt.Errorf("未知命令: %s", cmd)
+		return fmt.Errorf("未知命令: %s (使用 'sb_lxc help' 查看可用命令)", cmd)
 	}
 }
 

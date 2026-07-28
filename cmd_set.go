@@ -36,8 +36,12 @@ func CmdSet(args []string) error {
 			return cmdSetPort(client, ct, args[2:])
 		case "autostart":
 			on := true
-			if len(args) >= 3 && (args[2] == "off" || args[2] == "false" || args[2] == "0") {
-				on = false
+			if len(args) >= 3 {
+				parsed, err := parseBoolPayload(args[2])
+				if err != nil {
+					return fmt.Errorf("autostart 参数无效: %w", err)
+				}
+				on = parsed
 			}
 			if err := client.SetBootAutostart(name, on); err != nil {
 				return err

@@ -26,34 +26,20 @@ func AutoConfigureHostMacvlan(client *IncusClient) error {
 	return ensureHostMacvlanConnectivity(client, targets)
 }
 
-// AutoConfigureHostMacvlanForIP 为单个容器 IPv4 自动补齐宿主机侧 macvlan 路由。
-func AutoConfigureHostMacvlanForIP(ip string) error {
-	target, err := normalizeRouteTarget(ip)
-	if err != nil {
-		return err
+// removeHostMacvlanRoute 移除宿主机侧 sb-lxc-mv 上指向指定 IP 的 /32 路由。
+// 容器停止/删除时调用，避免死路由堆积。
+func removeHostMacvlanRoute(ip string) {
+	if ip == "" {
+		return
 	}
-	return ensureHostMacvlanRoutes([]string{target})
+	// 静默执行，路由不存在不算错误
+	_ = exec.Command("ip", "route", "del", ip+"/32", "dev", defaultHostMacvlanName).Run()
 }
 
 func warnAutoHostMacvlan(err error) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "⚠ 自动配置宿主机 macvlan 互通失败: %v\n", err)
 	}
-}
-
-func ensureHostMacvlanRoutes(targets []string) error {
-	routeTargets := make([]macvlanRouteTarget, 0, len(targets))
-	for _, target := range targets {
-		normalized, err := normalizeRouteTarget(target)
-		if err != nil {
-			return fmt.Errorf("路由目标 %q 无效: %w", target, err)
-		}
-		routeTargets = append(routeTargets, macvlanRouteTarget{
-			IP:    routeTargetIPv4(normalized),
-			Route: normalized,
-		})
-	}
-	return ensureHostMacvlanConnectivity(nil, routeTargets)
 }
 
 type macvlanRouteTarget struct {

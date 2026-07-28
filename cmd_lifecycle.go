@@ -2,8 +2,10 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // CmdStart 启动容器，若配置了域名映射则自动更新 /etc/hosts。
@@ -59,7 +61,7 @@ func CmdStart(name string) error {
 	return nil
 }
 
-// CmdUninstall 交互式选择并删除容器。
+// CmdUninstall 交互式选择并删除容器，并清理 /etc/hosts 与 /32 路由残留。
 func CmdUninstall() error {
 	name, err := selectContainer("选择要删除的容器")
 	if err != nil {
@@ -69,20 +71,44 @@ func CmdUninstall() error {
 		return nil
 	}
 	client := NewIncusClient()
+	// 先获取容器信息用于清理路由
+	ct, _ := client.GetContainer(name)
 	fmt.Printf("停止容器 %s ...\n", name)
 	_ = client.Stop(name)
 	fmt.Printf("删除容器 %s ...\n", name)
 	if err := client.Delete(name); err != nil {
 		return err
 	}
+	// 清理 /etc/hosts 残留行
+	if err := removeHostsLine(name); err != nil {
+		fmt.Fprintf(os.Stderr, "⚠ 清理 /etc/hosts 失败: %v\n", err)
+	}
+	// 清理 /32 路由残留
+	if ct != nil {
+		if ip := ct.IPv4(); ip != "" {
+			removeHostMacvlanRoute(ip)
+		}
+	}
 	fmt.Printf("✔ 容器 %s 已删除\n", name)
 	return nil
 }
 
-// CmdStop 停止容器。
+// CmdStop 停止容器，并清理对应的 /32 路由避免死路由堆积。
 func CmdStop(name string) error {
 	fmt.Printf("停止容器 %s ...\n", name)
-	return NewIncusClient().Stop(name)
+	client := NewIncusClient()
+	// 先获取容器 IP 用于后续路由清理
+	ct, _ := client.GetContainer(name)
+	if err := client.Stop(name); err != nil {
+		return err
+	}
+	// 清理 /32 路由
+	if ct != nil {
+		if ip := ct.IPv4(); ip != "" {
+			removeHostMacvlanRoute(ip)
+		}
+	}
+	return nil
 }
 
 // CmdIn 进入容器（交互式透传 stdio）。
@@ -90,9 +116,10 @@ func CmdIn(name string) error {
 	return NewIncusClient().Exec(name)
 }
 
-// CmdExport 导出容器为 ./容器名.tar.gz。
+// CmdExport 导出容器为 ./容器名_YYYYMMDD_HHMMSS.tar.gz。
 func CmdExport(name string) error {
-	path := fmt.Sprintf("./%s.tar.gz", name)
+	ts := time.Now().Format("20060102_150405")
+	path := fmt.Sprintf("./%s_%s.tar.gz", name, ts)
 	fmt.Printf("导出容器 %s -> %s ...\n", name, path)
 	if err := NewIncusClient().Export(name, path); err != nil {
 		return err
