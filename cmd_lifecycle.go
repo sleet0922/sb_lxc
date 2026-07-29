@@ -136,12 +136,28 @@ func CmdRestart(name string) error {
 // 示例: sb_lxc exec web ls -la /app
 //       sb_lxc exec web "curl -s http://localhost/health"
 // 命令通过 /bin/sh -c 执行，支持管道、重定向等 shell 特性。
+// 省略容器名时弹出交互式选择菜单（与 start/stop/in 一致）。
 func CmdExec(args []string) error {
-	if len(args) < 2 {
-		return fmt.Errorf("用法: sb_lxc exec <容器名> <命令...>\n示例:\n  sb_lxc exec web ls -la /app\n  sb_lxc exec web curl -s http://localhost/health")
+	var name string
+	var cmdArgs []string
+	if len(args) >= 1 {
+		name = args[0]
+		cmdArgs = args[1:]
+	} else {
+		// 交互式选择容器
+		n, err := selectContainer("选择要执行命令的容器")
+		if err != nil {
+			return err
+		}
+		if n == "" {
+			return nil
+		}
+		name = n
 	}
-	name := args[0]
-	command := strings.Join(args[1:], " ")
+	if len(cmdArgs) == 0 {
+		return fmt.Errorf("请提供要在 %s 内执行的命令\n示例: sb_lxc exec %s ls -la /app\n      sb_lxc exec %s curl -s http://localhost/health", name, name, name)
+	}
+	command := strings.Join(cmdArgs, " ")
 	if err := NewIncusClient().ExecStreaming(name, command, nil); err != nil {
 		return fmt.Errorf("exec %s 失败: %w", name, err)
 	}
