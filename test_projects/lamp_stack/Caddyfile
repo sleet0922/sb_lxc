@@ -1,0 +1,19 @@
+# LAMP Stack Caddyfile
+# Caddy 监听 80 端口，反代 PHP-FPM (unix socket)
+
+:80 {
+    root * /var/www/html
+    encode gzip
+
+    # PHP-FPM 通过 unix socket 通信
+    php_fastcgi unix//run/php/php8.4-fpm.sock
+
+    # 静态文件服务
+    file_server
+
+    # 健康检查日志
+    log {
+        output file /var/log/caddy/access.log
+        format json
+    }
+}

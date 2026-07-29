@@ -661,6 +661,12 @@ func pushFileToContainer(client *IncusClient, name, srcPath, dstPath string, mod
 			dstPath = filepath.ToSlash(filepath.Join(dstPath, filepath.Base(srcPath)))
 		}
 	}
+	// 确保目标父目录存在 (与 Docker COPY 行为一致)
+	if parent := filepath.ToSlash(filepath.Dir(dstPath)); parent != "" && parent != "/" && parent != "." {
+		if err := client.ExecStreaming(name, "mkdir -p "+parent, nil); err != nil {
+			return fmt.Errorf("创建目标父目录 %s 失败: %w", parent, err)
+		}
+	}
 	modeStr := fmt.Sprintf("%04o", mode.Perm())
 	return client.PushFile(name, dstPath, content, modeStr)
 }
