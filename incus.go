@@ -522,6 +522,35 @@ func (c *IncusClient) Exec(name string) error {
 	return nil
 }
 
+// execExitCode 等待 exec 操作完成并返回命令退出码。
+// op.Wait() 仅在操作本身失败时返回错误（如连接中断），
+// 命令在容器内以非零退出码结束时 op.Wait() 仍返回 nil。
+// 退出码存储在操作的 Metadata["return"] 字段中。
+func execExitCode(op incus.Operation) (int, error) {
+	if err := op.Wait(); err != nil {
+		return -1, err
+	}
+	opAPI := op.Get()
+	if opAPI.Metadata == nil {
+		return 0, nil
+	}
+	ret, ok := opAPI.Metadata["return"]
+	if !ok {
+		return 0, nil
+	}
+	// JSON 解码后数字类型为 float64
+	switch v := ret.(type) {
+	case float64:
+		return int(v), nil
+	case int:
+		return v, nil
+	case int64:
+		return int(v), nil
+	default:
+		return 0, nil
+	}
+}
+
 func (c *IncusClient) execQuiet(name string, args ...string) (string, error) {
 	if err := c.ready(); err != nil {
 		return "", err
@@ -539,8 +568,14 @@ func (c *IncusClient) execQuiet(name string, args ...string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	err = op.Wait()
-	return strings.TrimSpace(out.String()), err
+	exitCode, err := execExitCode(op)
+	if err != nil {
+		return strings.TrimSpace(out.String()), err
+	}
+	if exitCode != 0 {
+		return strings.TrimSpace(out.String()), fmt.Errorf("命令退出码 %d", exitCode)
+	}
+	return strings.TrimSpace(out.String()), nil
 }
 
 func (c *IncusClient) Launch(imageRef, name string) error {
@@ -968,7 +1003,14 @@ func (c *IncusClient) ExecStreaming(name, command string, extraEnv map[string]st
 	if err != nil {
 		return err
 	}
-	return op.Wait()
+	exitCode, err := execExitCode(op)
+	if err != nil {
+		return err
+	}
+	if exitCode != 0 {
+		return fmt.Errorf("命令退出码 %d", exitCode)
+	}
+	return nil
 }
 
 // PublishImage 将容器发布为本地 Incus 镜像，并设置别名。
