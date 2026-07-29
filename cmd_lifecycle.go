@@ -116,6 +116,38 @@ func CmdIn(name string) error {
 	return NewIncusClient().Exec(name)
 }
 
+// CmdRestart 重启容器：若容器正在运行则先停止再启动，若已停止则直接启动。
+// 复用 CmdStop/CmdStart 以保证 /32 路由清理、端口映射刷新、域名 hosts 更新等副作用一致。
+func CmdRestart(name string) error {
+	client := NewIncusClient()
+	ct, _ := client.GetContainer(name)
+	if ct != nil && strings.EqualFold(ct.Status, "Running") {
+		if err := CmdStop(name); err != nil {
+			return fmt.Errorf("停止容器失败: %w", err)
+		}
+	} else {
+		fmt.Printf("ℹ 容器 %s 未运行，直接启动\n", name)
+	}
+	return CmdStart(name)
+}
+
+// CmdExec 在容器内执行命令（非交互，stdout/stderr 实时输出）。
+// 语法: sb_lxc exec <容器名> <命令...>
+// 示例: sb_lxc exec web ls -la /app
+//       sb_lxc exec web "curl -s http://localhost/health"
+// 命令通过 /bin/sh -c 执行，支持管道、重定向等 shell 特性。
+func CmdExec(args []string) error {
+	if len(args) < 2 {
+		return fmt.Errorf("用法: sb_lxc exec <容器名> <命令...>\n示例:\n  sb_lxc exec web ls -la /app\n  sb_lxc exec web curl -s http://localhost/health")
+	}
+	name := args[0]
+	command := strings.Join(args[1:], " ")
+	if err := NewIncusClient().ExecStreaming(name, command, nil); err != nil {
+		return fmt.Errorf("exec %s 失败: %w", name, err)
+	}
+	return nil
+}
+
 // CmdExport 导出容器为 ./容器名_YYYYMMDD_HHMMSS.tar.gz。
 func CmdExport(name string) error {
 	ts := time.Now().Format("20060102_150405")

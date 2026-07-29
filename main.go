@@ -6,7 +6,7 @@ import (
 )
 
 // Version 工具版本
-const Version = "1.6.2"
+const Version = "1.6.3"
 
 // MirrorRemote 镜像源在本地的 remote 名称
 const MirrorRemote = "mirror-images"
@@ -64,8 +64,12 @@ func dispatch(cmd string, args []string) error {
 		return withContainer(args, "选择要启动的容器", CmdStart)
 	case "stop":
 		return withContainer(args, "选择要停止的容器", CmdStop)
+	case "restart":
+		return withContainer(args, "选择要重启的容器", CmdRestart)
 	case "in":
 		return withContainer(args, "选择要进入的容器", CmdIn)
+	case "exec":
+		return CmdExec(args)
 	case "set":
 		return CmdSet(args)
 	case "export":
@@ -139,7 +143,9 @@ func printUsage() {
   sb_lxc uninstall            | 删除容器
   sb_lxc start   [容器名]     | 启动容器
   sb_lxc stop    [容器名]     | 停止容器
+  sb_lxc restart [容器名]     | 重启容器
   sb_lxc in      [容器名]     | 进入容器 shell
+  sb_lxc exec    <容器名> <命令...> | 在容器内执行命令 (非交互)
   sb_lxc export  [容器名]     | 导出容器为 tar.gz
   sb_lxc import  [文件] [名]  | 从 tar.gz 导入容器
 
