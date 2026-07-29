@@ -1,0 +1,62 @@
+# Caddy 静态文件服务器 - 单阶段构建示例
+# 与 proj2 (nginx) 对比：Caddy 配置更简洁，Caddyfile 一段搞定静态+日志+健康检查
+#
+# 用法: sb_lxc build
+# 测试: curl http://caddy.test            (需宿主机 /etc/hosts 已写入域名)
+#       curl http://caddy.test/health
+#       curl http://caddy.test/healthz    (会 302 跳转到 /health)
+
+# ─────────── 基础镜像 ───────────
+FROM debian/13
+NAME caddy-fileserver
+
+# ─────────── 换清华 Debian 源 (debian/13 = trixie) ───────────
+RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources && \
+    printf 'deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie main contrib non-free non-free-firmware\n\
+deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie-updates main contrib non-free non-free-firmware\n\
+deb https://mirrors.tuna.tsinghua.edu.cn/debian-security/ trixie-security main contrib non-free non-free-firmware\n' \
+    > /etc/apt/sources.list
+
+# ─────────── 安装运行时依赖 ───────────
+# caddy:           现代化 Web 服务器 (Go 写的单二进制，支持 HTTP/2/QUIC)
+# ca-certificates: HTTPS (清华源已用 https)
+# curl procps:     健康检查与调试 (curl 调 /health, ps 查进程)
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        caddy ca-certificates curl procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# ─────────── 静态站点目录 ───────────
+RUN mkdir -p /var/www/html
+
+# ─────────── 复制站点内容与 Caddy 配置 ───────────
+COPY ./index.html /var/www/html/index.html
+COPY ./Caddyfile /etc/caddy/Caddyfile
+
+# ─────────── 注册 systemd 服务 ───────────
+# caddy 包自带 /lib/systemd/system/caddy.service，但默认监听 80/443 + 自动 HTTPS
+# 我们用自己的 Caddyfile 禁用 HTTPS，仅监听 80，并通过环境变量覆盖配置路径
+# 这里禁用默认 caddy.service，注册自定义 caddy-fileserver.service
+RUN systemctl disable caddy.service 2>/dev/null || true
+
+# ExecStart 用 caddy run 而非 caddy start (后者会 fork 后台进程，systemd Type=simple 无法跟踪)
+RUN printf '[Unit]\n\
+Description=Caddy Static Site (sb_lxc)\n\
+After=network.target\n\
+\n\
+[Service]\n\
+Type=simple\n\
+ExecStartPre=/usr/bin/caddy validate --config /etc/caddy/Caddyfile\n\
+ExecStart=/usr/bin/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile\n\
+Restart=on-failure\n\
+RestartSec=3\n\
+StandardOutput=journal\n\
+StandardError=journal\n\
+\n\
+[Install]\n\
+WantedBy=multi-user.target\n' > /etc/systemd/system/caddy-fileserver.service && \
+    systemctl enable caddy-fileserver.service
+
+# ─────────── 运行时配置 ───────────
+EXPOSE 80/tcp
+DOMAIN caddy.test
+AUTOSTART on

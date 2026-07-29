@@ -1,0 +1,108 @@
+# Flask + Redis 计数器 - 多阶段构建示例
+# 阶段 1: builder 用 venv 隔离 Python 依赖 (Flask + redis-py)
+# 阶段 2: runtime 只装 python3 + redis-server，从 builder 复制 venv
+#
+# 与 proj1 (SQLite 单阶段) 对比：
+#   - 多阶段：builder 装齐 pip+venv 编译链，runtime 不带 pip，体积更小、攻击面更小
+#   - 多服务：Redis (systemd 拉起) + Flask 应用 (systemd 拉起)
+#
+# 用法: sb_lxc build
+# 测试: curl http://redis.test/         (需宿主机 /etc/hosts 已写入域名)
+#       curl http://redis.test/api/count
+#       curl http://redis.test/health   (Redis 连通性)
+
+# === 阶段 1: builder (venv 安装 Python 依赖) ===
+FROM debian/13 AS builder
+
+# 换清华源 (debian/13 = trixie)
+RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources && \
+    printf 'deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie main contrib non-free non-free-firmware\n\
+deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie-updates main contrib non-free non-free-firmware\n\
+deb https://mirrors.tuna.tsinghua.edu.cn/debian-security/ trixie-security main contrib non-free non-free-firmware\n' \
+    > /etc/apt/sources.list
+
+# python3-venv: 创建虚拟环境 (Debian 13 默认 python3 自带 ensurepip，但 venv 需要单独装)
+# python3-pip:  升级 pip 到最新版 (旧 pip 在 PyPI 镜像可能 TLS 不兼容)
+# ca-certificates: HTTPS 访问 PyPI
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        python3 python3-venv python3-pip ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# 创建 venv 并升级 pip (清华 PyPI 源)
+RUN python3 -m venv /opt/venv && \
+    /opt/venv/bin/pip install --upgrade pip \
+        -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 先复制依赖清单 (利用层缓存: requirements.txt 不变则复用 install 层)
+COPY ./requirements.txt /build/requirements.txt
+RUN /opt/venv/bin/pip install -r /build/requirements.txt \
+        -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# === 阶段 2: 运行时 ===
+FROM debian/13
+NAME flask-redis
+
+# 换清华源
+RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources && \
+    printf 'deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie main contrib non-free non-free-firmware\n\
+deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie-updates main contrib non-free non-free-firmware\n\
+deb https://mirrors.tuna.tsinghua.edu.cn/debian-security/ trixie-security main contrib non-free non-free-firmware\n' \
+    > /etc/apt/sources.list
+
+# 运行时依赖:
+# python3:        运行 Flask 应用 (venv 自带 Python 解释器，但需系统 python3 作为 fallback)
+# redis-server:   内存数据库 (systemd 拉起 redis-server.service)
+# ca-certificates: HTTPS
+# curl procps:    健康检查与调试 (curl 调 /health, ps 查进程)
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        python3 redis-server ca-certificates curl procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# 从 builder 复制 venv (含 Flask + redis-py，不含 pip 等构建工具)
+COPY --from=builder /opt/venv /opt/venv
+
+# 应用目录
+RUN mkdir -p /app
+COPY ./app.py /app/app.py
+
+# 让 venv 中的 python 优先于系统 python3
+# 注意 PATH 设到 systemd unit Environment 中，避免直接 export 不生效
+# 用 venv 中的 python 启动应用，无需手动激活 venv
+RUN ln -sf /opt/venv/bin/python /usr/local/bin/app-python
+
+# ─────────── 注册 Redis systemd 服务 (使用系统默认 redis-server.service) ───────────
+# Debian 13 的 redis-server 包已自带 /lib/systemd/system/redis-server.service
+# 只需 enable 即可
+RUN systemctl enable redis-server.service
+
+# ─────────── 注册 Flask 应用 systemd 服务 ───────────
+# After=redis-server.service 确保应用启动前 Redis 已就绪
+RUN printf '[Unit]\n\
+Description=Flask + Redis Counter (sb_lxc)\n\
+After=network.target redis-server.service\n\
+Requires=redis-server.service\n\
+\n\
+[Service]\n\
+Type=simple\n\
+ExecStart=/usr/local/bin/app-python /app/app.py\n\
+WorkingDirectory=/app\n\
+Environment=REDIS_HOST=127.0.0.1\n\
+Environment=REDIS_PORT=6379\n\
+Restart=on-failure\n\
+RestartSec=3\n\
+StandardOutput=journal\n\
+StandardError=journal\n\
+\n\
+[Install]\n\
+WantedBy=multi-user.target\n' > /etc/systemd/system/flask-redis.service && \
+    systemctl enable flask-redis.service
+
+# ─────────── 运行时配置 ───────────
+ENV FLASK_ENV=production
+ENV PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+EXPOSE 5000/tcp
+DOMAIN redis.test
+AUTOSTART on

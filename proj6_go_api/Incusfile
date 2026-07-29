@@ -1,0 +1,100 @@
+# Go HTTP API - 多阶段构建示例 (零外部依赖，仅用标准库)
+# 阶段 1: builder 装 Go 1.25 编译静态二进制 (CGO_ENABLED=0)
+# 阶段 2: runtime 极简，只装 ca-certificates，从 builder 复制编译好的二进制
+#
+# 与 taskhub 区别: 本项目不依赖任何外部库 (无 MariaDB/Redis/Beego)，
+#   仅用 Go 标准库，编译产物是单文件二进制，是 Go 多阶段构建的最纯净范例。
+#
+# 用法: sb_lxc build
+# 测试: curl http://go.test/             (需宿主机 /etc/hosts 已写入域名)
+#       curl http://go.test/api/info
+#       curl http://go.test/api/echo?msg=hello
+#       curl http://go.test/health
+
+# === 阶段 1: builder (Go 编译) ===
+FROM debian/13 AS builder
+
+# 换清华源 (debian/13 = trixie)
+RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources && \
+    printf 'deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie main contrib non-free non-free-firmware\n\
+deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie-updates main contrib non-free non-free-firmware\n\
+deb https://mirrors.tuna.tsinghua.edu.cn/debian-security/ trixie-security main contrib non-free non-free-firmware\n' \
+    > /etc/apt/sources.list
+
+# 装 curl + ca-certificates: 下载 Go 二进制 + HTTPS
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        curl xz-utils ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Go 1.25 官方二进制 (使用国内镜像 golang.google.cn 加速下载)
+# Debian 13 仓库自带 Go 1.24，但 go.mod 要求 1.25，因此从官方下载
+RUN curl -fsSL https://golang.google.cn/dl/go1.25.0.linux-amd64.tar.gz | tar -xz -C /usr/local && \
+    ln -sf /usr/local/go/bin/go /usr/local/bin/go
+
+WORKDIR /src
+
+# 七牛 Go 模块代理 (本例无外部依赖，go mod download 不会真正下载，但保留以防添加依赖)
+ENV GOPROXY=https://goproxy.cn
+ENV GOSUMDB=off
+# CGO_ENABLED=0 编译纯静态二进制，runtime 不需要 libc6
+ENV CGO_ENABLED=0
+
+# 先复制 go.mod (利用层缓存)
+COPY ./go.mod ./
+# 本项目无 go.sum，且 go.mod 不需要外部依赖，go mod download 仍会成功
+RUN go mod download
+
+# 复制源码并编译
+# -trimpath:  去除构建机器的绝对路径
+# -ldflags '-s -w':  去除调试符号，二进制更小
+# -X main.version=v1.6.0:  注入版本号到 main.version 变量
+COPY ./main.go ./
+RUN mkdir -p /out && go build -trimpath -ldflags '-s -w -X main.version=v1.6.0' -o /out/go-api .
+
+# === 阶段 2: 运行时 ===
+FROM debian/13
+NAME go-api
+
+# 换清华源
+RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources && \
+    printf 'deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie main contrib non-free non-free-firmware\n\
+deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie-updates main contrib non-free non-free-firmware\n\
+deb https://mirrors.tuna.tsinghua.edu.cn/debian-security/ trixie-security main contrib non-free non-free-firmware\n' \
+    > /etc/apt/sources.list
+
+# 运行时依赖:
+# ca-certificates: HTTPS (应用可能调用外部 API)
+# curl procps:     健康检查与调试
+# 注意: CGO_ENABLED=0 编译的纯静态 Go 二进制理论上不需要 libc6，
+#       但 Debian 13 基础镜像已自带 libc6，不影响体积。
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates curl procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# 从 builder 复制编译产物
+COPY --from=builder /out/go-api /usr/local/bin/go-api
+RUN chmod +x /usr/local/bin/go-api
+
+# ─────────── 注册 systemd 服务 ───────────
+RUN printf '[Unit]\n\
+Description=Go HTTP API (sb_lxc)\n\
+After=network.target\n\
+\n\
+[Service]\n\
+Type=simple\n\
+ExecStart=/usr/local/bin/go-api\n\
+Restart=on-failure\n\
+RestartSec=3\n\
+StandardOutput=journal\n\
+StandardError=journal\n\
+\n\
+[Install]\n\
+WantedBy=multi-user.target\n' > /etc/systemd/system/go-api.service && \
+    systemctl enable go-api.service
+
+# ─────────── 运行时配置 ───────────
+ENV LISTEN_ADDR=:8080
+
+EXPOSE 8080/tcp
+DOMAIN go.test
+AUTOSTART on

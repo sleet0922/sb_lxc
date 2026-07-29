@@ -1,0 +1,36 @@
+# Caddyfile - Caddy v2 配置文件
+# 监听 80 端口，禁用自动 HTTPS (容器内无证书需求)
+# 文件服务器根目录: /var/www/html
+# 健康检查: /health 返回固定 JSON
+
+{
+    # 全局选项: 禁用自动 HTTPS (容器内运行，不需要公网证书)
+    auto_https off
+    # 简化日志: 仅输出到 stdout (systemd 会捕获)
+    admin off
+}
+
+:80 {
+    # 静态文件根目录
+    root * /var/www/html
+
+    # 启用文件服务器，启用目录列表 (用于 /browse)
+    file_server browse
+
+    # 健康检查端点: 返回 JSON
+    handle /health {
+        respond `{"status":"ok","server":"caddy"}` 200
+        header Content-Type application/json
+    }
+
+    # /healthz 别名
+    handle /healthz {
+        redir /health 302
+    }
+
+    # 简单访问日志
+    log {
+        output stdout
+        format console
+    }
+}
