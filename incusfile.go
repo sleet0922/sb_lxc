@@ -7,41 +7,57 @@ import (
 	"strings"
 )
 
-// Incusfile 是 Dockerfile 风格的 Incus 镜像构建描述文件。
-// sb_lxc build 读取该文件，启动一个临时构建容器，按顺序执行指令，
-// 最后将容器发布为本地 Incus 镜像，可选地直接启动正式容器。
+// Incusfile 是 Dockerfile 风格的 Incus 镜像构建描述文件，支持多阶段构建。
+// sb_lxc build 读取该文件，按顺序执行各构建阶段，最后将最终阶段容器发布为镜像。
 //
 // 支持的指令：
 //
-//	FROM <image>          基础镜像 (如 debian/12, alpine/3.20, 也兼容 debian:12)
-//	NAME <name>           镜像别名 + 容器名
-//	RUN <command>         在容器内执行 shell 命令 (通过 /bin/sh -c)
-//	COPY <src> <dst>      从宿主机复制文件/目录到容器
-//	ENV <KEY>=<VALUE>     设置环境变量 (写入 /etc/environment + profile.d)
-//	EXPOSE <port>[/<proto>] ...  声明端口映射 (运行时自动创建)
-//	DOMAIN <domain>       域名映射 (运行时写入 /etc/hosts)
-//	AUTOSTART on|off      开机自启动
+//	FROM <image> [AS <name>]        基础镜像，开始新构建阶段 (多阶段)
+//	NAME <name>                     镜像别名 + 容器名 (全局，作用于最终镜像)
+//	WORKDIR <path>                  设置后续 RUN/COPY 的工作目录
+//	RUN <command>                   在容器内执行 shell 命令 (通过 /bin/sh -c)
+//	COPY [--from=<stage>] <src> <dst>  从宿主机或指定阶段复制文件/目录
+//	    --from 省略时从宿主机复制；指定阶段名或数字索引时从该阶段容器复制
+//	ENV <KEY>=<VALUE>               设置环境变量 (写入 /etc/environment + profile.d)
+//	EXPOSE <port>[/<proto>] ...     声明端口映射 (运行时自动创建)
+//	DOMAIN <domain>                 域名映射 (运行时写入 /etc/hosts)
+//	AUTOSTART on|off                开机自启动
 type Incusfile struct {
-	Path       string
-	From       string
-	Name       string
-	Steps      []BuildStep // RUN/COPY/ENV 按出现顺序执行
-	Exposes    []PortSpec
-	Domain     string
-	Autostart  *bool
+	Path   string
+	Stages []Stage
+	// 以下字段从最终阶段同步，保持向后兼容 (buildImageProperties 等函数直接读取)
+	From      string
+	Name      string
+	Steps     []BuildStep
+	Exposes   []PortSpec
+	Domain    string
+	Autostart *bool
 }
 
-// BuildStep 是一个有序的构建步骤 (RUN/COPY/ENV)。
+// Stage 表示一个构建阶段 (FROM ... AS ...)。
+// 多阶段构建时，中间阶段的容器在构建完成后清理，最终阶段发布为镜像。
+type Stage struct {
+	Name      string      // AS 后的名字，用于 COPY --from=<name> 引用
+	From      string      // 基础镜像 (已规范化)
+	Steps     []BuildStep // RUN/COPY/ENV/WORKDIR 按出现顺序执行
+	Exposes   []PortSpec  // EXPOSE (运行时指令，通常在最终阶段)
+	Domain    string      // DOMAIN
+	Autostart *bool       // AUTOSTART
+}
+
+// BuildStep 是一个有序的构建步骤 (RUN/COPY/ENV/WORKDIR)。
 type BuildStep struct {
-	Kind string // "RUN", "COPY", "ENV"
-	Run  string
-	Copy CopySpec
-	Env  EnvSpec
+	Kind    string // "RUN", "COPY", "ENV", "WORKDIR"
+	Run     string
+	Copy    CopySpec
+	Env     EnvSpec
+	Workdir string
 }
 
 type CopySpec struct {
-	Src string
-	Dst string
+	Src  string
+	Dst  string
+	From string // --from=stage_name 或 stage_index, 空表示从宿主机复制
 }
 
 type EnvSpec struct {
@@ -108,6 +124,29 @@ func parseIncusfile(path string) (*Incusfile, error) {
 		}
 		logical = append(logical, logicalLine{no: startNo, text: cur})
 	}
+
+	// 解析逻辑行：遇到 FROM 开始新阶段
+	var currentStage *Stage
+	stageByName := map[string]int{}
+
+	startStage := func(fromImg, stageName string, lineNo int) error {
+		if fromImg == "" {
+			return fmt.Errorf("line %d: FROM 需要镜像引用", lineNo)
+		}
+		if currentStage != nil {
+			f.Stages = append(f.Stages, *currentStage)
+		}
+		currentStage = &Stage{
+			From: normalizeImageRef(fromImg),
+			Name: stageName,
+		}
+		if stageName != "" {
+			// 记录阶段名到索引映射 (索引是保存后的位置)
+			stageByName[stageName] = len(f.Stages)
+		}
+		return nil
+	}
+
 	for _, ll := range logical {
 		lineNo := ll.no
 		raw := ll.text
@@ -123,57 +162,120 @@ func parseIncusfile(path string) (*Incusfile, error) {
 		payload := directivePayload(raw)
 		switch directive {
 		case "FROM":
-			if payload == "" {
-				return nil, fmt.Errorf("line %d: FROM 需要镜像引用", lineNo)
+			fromImg, stageName := parseFromPayload(payload)
+			if err := startStage(fromImg, stageName, lineNo); err != nil {
+				return nil, err
 			}
-			f.From = normalizeImageRef(payload)
 		case "NAME":
 			if payload == "" {
 				return nil, fmt.Errorf("line %d: NAME 需要名称", lineNo)
 			}
 			f.Name = payload
+		case "WORKDIR":
+			if currentStage == nil {
+				return nil, fmt.Errorf("line %d: WORKDIR 必须在 FROM 之后", lineNo)
+			}
+			if payload == "" {
+				return nil, fmt.Errorf("line %d: WORKDIR 需要路径", lineNo)
+			}
+			currentStage.Steps = append(currentStage.Steps, BuildStep{Kind: "WORKDIR", Workdir: payload})
 		case "RUN":
+			if currentStage == nil {
+				return nil, fmt.Errorf("line %d: RUN 必须在 FROM 之后", lineNo)
+			}
 			if payload == "" {
 				return nil, fmt.Errorf("line %d: RUN 需要命令", lineNo)
 			}
-			f.Steps = append(f.Steps, BuildStep{Kind: "RUN", Run: payload})
+			currentStage.Steps = append(currentStage.Steps, BuildStep{Kind: "RUN", Run: payload})
 		case "COPY":
-			src, dst, err := parseCopyPayload(payload)
+			if currentStage == nil {
+				return nil, fmt.Errorf("line %d: COPY 必须在 FROM 之后", lineNo)
+			}
+			from, src, dst, err := parseCopyPayload(payload)
 			if err != nil {
 				return nil, fmt.Errorf("line %d: %w", lineNo, err)
 			}
-			f.Steps = append(f.Steps, BuildStep{Kind: "COPY", Copy: CopySpec{Src: src, Dst: dst}})
+			currentStage.Steps = append(currentStage.Steps, BuildStep{Kind: "COPY", Copy: CopySpec{Src: src, Dst: dst, From: from}})
 		case "ENV":
+			if currentStage == nil {
+				return nil, fmt.Errorf("line %d: ENV 必须在 FROM 之后", lineNo)
+			}
 			kv, err := parseEnvPayload(payload)
 			if err != nil {
 				return nil, fmt.Errorf("line %d: %w", lineNo, err)
 			}
-			f.Steps = append(f.Steps, BuildStep{Kind: "ENV", Env: kv})
+			currentStage.Steps = append(currentStage.Steps, BuildStep{Kind: "ENV", Env: kv})
 		case "EXPOSE":
+			if currentStage == nil {
+				return nil, fmt.Errorf("line %d: EXPOSE 必须在 FROM 之后", lineNo)
+			}
 			ports, err := parseExposePayload(payload)
 			if err != nil {
 				return nil, fmt.Errorf("line %d: %w", lineNo, err)
 			}
-			f.Exposes = append(f.Exposes, ports...)
+			currentStage.Exposes = append(currentStage.Exposes, ports...)
 		case "DOMAIN":
+			if currentStage == nil {
+				return nil, fmt.Errorf("line %d: DOMAIN 必须在 FROM 之后", lineNo)
+			}
 			if payload == "" {
 				return nil, fmt.Errorf("line %d: DOMAIN 需要域名", lineNo)
 			}
-			f.Domain = payload
+			currentStage.Domain = payload
 		case "AUTOSTART":
+			if currentStage == nil {
+				return nil, fmt.Errorf("line %d: AUTOSTART 必须在 FROM 之后", lineNo)
+			}
 			on, err := parseBoolPayload(payload)
 			if err != nil {
 				return nil, fmt.Errorf("line %d: %w", lineNo, err)
 			}
-			f.Autostart = &on
+			currentStage.Autostart = &on
 		default:
-			return nil, fmt.Errorf("line %d: 未知指令 %s (支持: FROM NAME RUN COPY ENV EXPOSE DOMAIN AUTOSTART)", lineNo, directive)
+			return nil, fmt.Errorf("line %d: 未知指令 %s (支持: FROM NAME WORKDIR RUN COPY ENV EXPOSE DOMAIN AUTOSTART)", lineNo, directive)
 		}
 	}
-	if f.From == "" {
+
+	// 保存最后一个阶段
+	if currentStage != nil {
+		f.Stages = append(f.Stages, *currentStage)
+	}
+	if len(f.Stages) == 0 {
 		return nil, fmt.Errorf("%s 缺少 FROM 指令", path)
 	}
+
+	// 同步最终阶段到顶层字段 (保持向后兼容，buildImageProperties 等函数直接读取)
+	last := &f.Stages[len(f.Stages)-1]
+	f.From = last.From
+	f.Steps = last.Steps
+	f.Exposes = last.Exposes
+	f.Domain = last.Domain
+	f.Autostart = last.Autostart
 	return f, nil
+}
+
+// parseFromPayload 解析 FROM 指令的 payload。
+// 格式: <image> [AS <name>]
+// 支持示例:
+//
+//	FROM debian/12
+//	FROM debian:12 AS builder
+//	FROM golang:1.26-alpine AS frontend-build
+func parseFromPayload(payload string) (image, stageName string) {
+	// 查找 AS 关键字 (大小写不敏感)
+	upper := strings.ToUpper(payload)
+	idx := strings.Index(upper, " AS ")
+	if idx < 0 {
+		return strings.TrimSpace(payload), ""
+	}
+	image = strings.TrimSpace(payload[:idx])
+	rest := strings.TrimSpace(payload[idx+4:])
+	// stageName 取 rest 的第一个 token
+	fields := strings.Fields(rest)
+	if len(fields) > 0 {
+		stageName = fields[0]
+	}
+	return image, stageName
 }
 
 // directivePayload 提取指令关键字后的全部内容，保留空格、引号等。
@@ -196,18 +298,33 @@ func normalizeImageRef(ref string) string {
 	return ref
 }
 
-// parseCopyPayload 解析 COPY 指令的 payload，支持引号包裹的含空格路径。
-// COPY ./index.html /var/www/html/index.html
-// COPY "my file.txt" "/path with spaces/file.txt"
-func parseCopyPayload(payload string) (src, dst string, err error) {
-	fields, err := shellSplit(payload)
+// parseCopyPayload 解析 COPY 指令的 payload，支持 --from 标志和引号路径。
+// 格式: [--from=<stage>] <src> <dst>
+// --from 可以是阶段名 (如 "builder") 或数字索引 (如 "0")
+// 示例:
+//
+//	COPY ./index.html /var/www/html/index.html
+//	COPY --from=builder /app/bin/app /usr/local/bin/app
+//	COPY --from=0 /src/public /app/public
+func parseCopyPayload(payload string) (from, src, dst string, err error) {
+	rest := payload
+	// 检查 --from= 标志
+	if strings.HasPrefix(rest, "--from=") {
+		spaceIdx := strings.IndexAny(rest, " \t")
+		if spaceIdx < 0 {
+			return "", "", "", fmt.Errorf("COPY --from 需要源和目标路径")
+		}
+		from = strings.TrimPrefix(rest[:spaceIdx], "--from=")
+		rest = strings.TrimLeft(rest[spaceIdx:], " \t")
+	}
+	fields, err := shellSplit(rest)
 	if err != nil {
-		return "", "", fmt.Errorf("COPY 用法: COPY <src> <dst>: %w", err)
+		return "", "", "", fmt.Errorf("COPY 用法: COPY [--from=<stage>] <src> <dst>: %w", err)
 	}
 	if len(fields) != 2 {
-		return "", "", fmt.Errorf("COPY 用法: COPY <src> <dst> (得到 %d 个参数)", len(fields))
+		return "", "", "", fmt.Errorf("COPY 用法: COPY [--from=<stage>] <src> <dst> (得到 %d 个参数)", len(fields))
 	}
-	return fields[0], fields[1], nil
+	return from, fields[0], fields[1], nil
 }
 
 // shellSplit 按空白切分字符串，但支持双引号包裹的含空格字段。

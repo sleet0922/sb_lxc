@@ -115,7 +115,7 @@ func CmdBuild(args []string) error {
 }
 
 func buildUsage() string {
-	return `sb_lxc build - 从 Incusfile 构建镜像并启动容器
+	return `sb_lxc build - 从 Incusfile 构建镜像并启动容器 (支持多阶段构建)
 
 用法:
   sb_lxc build [Incusfile]                构建镜像并启动容器 (默认 ./Incusfile)
@@ -124,23 +124,36 @@ func buildUsage() string {
   sb_lxc build show                       列出可用于 FROM 的基础镜像
 
 Incusfile 指令:
-  FROM <image>              基础镜像 (如 debian/12 或 debian:12)
-  NAME <name>               镜像别名 + 容器名
-  RUN <command>             在容器内执行 shell 命令
-  COPY <src> <dst>          从宿主机复制文件/目录到容器
-  ENV <KEY>=<VALUE>         设置环境变量
-  EXPOSE <port>[/<proto>]   声明端口映射 (可多个，空格分隔)
-  DOMAIN <domain>           域名映射
-  AUTOSTART on|off          开机自启动
+  FROM <image> [AS <name>]   基础镜像，开始新构建阶段 (多阶段)
+  NAME <name>                镜像别名 + 容器名 (全局)
+  WORKDIR <path>             设置后续 RUN/COPY 的工作目录
+  RUN <command>              在容器内执行 shell 命令
+  COPY [--from=<stage>] <src> <dst>  从宿主机或指定阶段复制
+  ENV <KEY>=<VALUE>          设置环境变量
+  EXPOSE <port>[/<proto>]    声明端口映射
+  DOMAIN <domain>            域名映射
+  AUTOSTART on|off           开机自启动
 
-示例 Incusfile:
+多阶段构建示例 (分离构建环境与运行时):
+  FROM debian/13 AS builder
+  WORKDIR /src
+  RUN apt-get update && apt-get install -y golang-go
+  COPY ./main.go .
+  RUN go build -o app .
+
+  FROM debian/13
+  RUN apt-get update && apt-get install -y ca-certificates
+  COPY --from=builder /src/app /usr/local/bin/app
+  EXPOSE 8080/tcp
+  DOMAIN myapp.test
+  AUTOSTART on
+
+单阶段示例:
   FROM debian/12
   NAME my-nginx
   RUN apt-get update && apt-get install -y nginx
-  RUN echo "daemon off;" >> /etc/nginx/nginx.conf
   COPY ./index.html /var/www/html/index.html
   EXPOSE 80/tcp
-  DOMAIN nginx.test
   AUTOSTART on
 `
 }
@@ -242,100 +255,178 @@ echo "✔ 镜像源已切换为清华源"`
 	return nil
 }
 
-// buildImage 执行构建流程：启动临时容器 -> 按顺序执行 Steps -> 发布镜像 -> 清理。
-// Steps 严格按 Incusfile 中的出现顺序执行 (RUN/COPY/ENV)，确保 COPY 依赖的目录
-// 能由前置 RUN 创建。
+// buildImage 执行多阶段构建流程：按顺序构建各阶段，最终阶段发布为镜像。
+// 中间阶段的容器保持运行 (供后续阶段 COPY --from 引用)，最终统一清理。
+// 单阶段 Incusfile (只有一个 FROM) 走相同的代码路径，行为与旧版一致。
 func buildImage(client *IncusClient, f *Incusfile, alias string) error {
-	// 构建容器名加入 PID 与随机后缀，避免并发构建碰撞
-	buildName := fmt.Sprintf("sb-lxc-build-%d-%d", os.Getpid(), time.Now().UnixNano())
+	stages := f.Stages
+	contextDir := filepath.Dir(f.Path)
+	stageContainers := make([]string, len(stages))
+	stageByName := map[string]int{}
+	for i, s := range stages {
+		if s.Name != "" {
+			stageByName[s.Name] = i
+		}
+	}
 
 	// 清理同名旧别名 (含其引用的孤儿镜像)
 	if err := client.ReplaceImageAlias(alias); err != nil {
 		fmt.Printf("⚠ 清理旧镜像别名失败: %v\n", err)
 	}
 
-	// 启动构建容器
-	fmt.Printf("▶ [1/4] 启动构建容器 %s (镜像 %s) ...\n", buildName, f.From)
-	if err := client.Launch(f.From, buildName); err != nil {
-		return fmt.Errorf("启动构建容器失败: %w", err)
-	}
-
-	// 确保清理临时容器：先尝试优雅停止，失败则强制停止，确保 Delete 不会因容器仍在运行而失败
+	// 确保清理所有阶段容器 (含中间阶段和最终阶段)
 	defer func() {
-		fmt.Printf("▶ 清理构建容器 %s ...\n", buildName)
-		if err := client.Stop(buildName); err != nil {
-			// 优雅停止失败（容器挂起/超时），强制停止以保证后续 Delete 成功
-			fmt.Fprintf(os.Stderr, "  ⚠ 优雅停止失败 (%v)，强制停止 ...\n", err)
-			_ = client.StopForce(buildName)
-		}
-		if err := client.Delete(buildName); err != nil {
-			fmt.Fprintf(os.Stderr, "  ⚠ 删除构建容器失败: %v\n", err)
+		for i := len(stageContainers) - 1; i >= 0; i-- {
+			name := stageContainers[i]
+			if name == "" {
+				continue
+			}
+			fmt.Printf("▶ 清理阶段容器 %s ...\n", name)
+			if err := client.Stop(name); err != nil {
+				_ = client.StopForce(name)
+			}
+			if err := client.Delete(name); err != nil {
+				fmt.Fprintf(os.Stderr, "  ⚠ 删除阶段容器 %s 失败: %v\n", name, err)
+			}
 		}
 	}()
 
-	// 等待网络就绪 (RUN 中常有 apt-get/apk 等需要网络)
-	fmt.Printf("▶ [2/4] 等待容器网络就绪 ...\n")
-	ip := waitForIP(client, buildName, 30)
-	if ip == "" {
-		fmt.Printf("⚠ 构建容器未获取 IPv4，RUN 命令可能因网络问题失败\n")
-	} else {
-		fmt.Printf("  构建容器 IPv4: %s\n", ip)
-	}
-
-	// 自动配置镜像源：检测到官方源不可达时，自动换为国内镜像源
-	// 适用于 Debian/Ubuntu 系容器 (apt-get 场景)，避免 deb.debian.org 在国内访问超时
-	if ip != "" {
-		if err := autoConfigureAptMirror(client, buildName); err != nil {
-			fmt.Fprintf(os.Stderr, "⚠ 自动配置镜像源失败: %v\n", err)
+	totalStages := len(stages)
+	for si, stage := range stages {
+		stageContainer := fmt.Sprintf("sb-lxc-build-%d-%d-s%d", os.Getpid(), time.Now().UnixNano(), si)
+		stageContainers[si] = stageContainer
+		stageLabel := stage.Name
+		if stageLabel == "" {
+			stageLabel = fmt.Sprintf("stage %d", si+1)
 		}
-	}
 
-	// 按顺序执行 Steps (RUN/COPY/ENV 严格按 Incusfile 顺序)
-	fmt.Printf("▶ [3/4] 执行 %d 个构建步骤 ...\n", len(f.Steps))
-	runEnv := map[string]string{}
-	var collectedEnvs []EnvSpec
-	contextDir := filepath.Dir(f.Path)
-	total := len(f.Steps)
-	for i, s := range f.Steps {
-		switch s.Kind {
-		case "ENV":
-			fmt.Printf("  [%d/%d] ENV %s=%s\n", i+1, total, s.Env.Key, s.Env.Value)
-			runEnv[s.Env.Key] = s.Env.Value
-			collectedEnvs = append(collectedEnvs, s.Env)
-		case "COPY":
-			fmt.Printf("  [%d/%d] COPY %s -> %s\n", i+1, total, s.Copy.Src, s.Copy.Dst)
-			if err := applyCopy(client, buildName, s.Copy, contextDir); err != nil {
+		isLast := si == totalStages-1
+		role := "中间阶段"
+		if isLast {
+			role = "最终阶段"
+		}
+		fmt.Printf("\n▶ [%d/%d] %s %q (镜像 %s) ...\n", si+1, totalStages, role, stageLabel, stage.From)
+
+		// 启动阶段容器
+		if err := client.Launch(stage.From, stageContainer); err != nil {
+			return fmt.Errorf("启动阶段 %d 容器失败: %w", si+1, err)
+		}
+
+		// 等待网络就绪
+		ip := waitForIP(client, stageContainer, 30)
+		if ip == "" {
+			fmt.Printf("⚠ 阶段 %d 容器未获取 IPv4，RUN 命令可能因网络问题失败\n", si+1)
+		} else {
+			fmt.Printf("  阶段 %d IPv4: %s\n", si+1, ip)
+		}
+
+		// 自动配置镜像源 (仅 apt 系)
+		if ip != "" {
+			if err := autoConfigureAptMirror(client, stageContainer); err != nil {
+				fmt.Fprintf(os.Stderr, "⚠ 阶段 %d 自动配置镜像源失败: %v\n", si+1, err)
+			}
+		}
+
+		// 执行步骤
+		workdir := "/"
+		runEnv := map[string]string{}
+		var collectedEnvs []EnvSpec
+		total := len(stage.Steps)
+		for i, step := range stage.Steps {
+			switch step.Kind {
+			case "WORKDIR":
+				workdir = step.Workdir
+				if !filepath.IsAbs(workdir) {
+					workdir = filepath.Join("/", workdir)
+				}
+				fmt.Printf("  [阶段%d %d/%d] WORKDIR %s\n", si+1, i+1, total, workdir)
+				if err := client.ExecStreaming(stageContainer, "mkdir -p "+workdir, nil); err != nil {
+					return fmt.Errorf("WORKDIR 创建目录失败: %w", err)
+				}
+			case "ENV":
+				fmt.Printf("  [阶段%d %d/%d] ENV %s=%s\n", si+1, i+1, total, step.Env.Key, step.Env.Value)
+				runEnv[step.Env.Key] = step.Env.Value
+				collectedEnvs = append(collectedEnvs, step.Env)
+			case "COPY":
+				fromLabel := "宿主机"
+				if step.Copy.From != "" {
+					fromLabel = "阶段 " + step.Copy.From
+				}
+				fmt.Printf("  [阶段%d %d/%d] COPY (from %s) %s -> %s\n", si+1, i+1, total, fromLabel, step.Copy.Src, step.Copy.Dst)
+				dst := step.Copy.Dst
+				if !filepath.IsAbs(dst) {
+					dst = filepath.Join(workdir, dst)
+				}
+				if step.Copy.From != "" {
+					// 跨容器复制: --from=<stage_name 或 数字索引>
+					srcStageIdx, ok := stageByName[step.Copy.From]
+					if !ok {
+						if n, err := strconv.Atoi(step.Copy.From); err == nil && n >= 0 && n < si {
+							srcStageIdx = n
+							ok = true
+						}
+					}
+					if !ok {
+						return fmt.Errorf("COPY --from=%s: 找不到该阶段 (可用: %v)", step.Copy.From, stageNames(stages, si))
+					}
+					srcContainer := stageContainers[srcStageIdx]
+					if err := client.CopyBetweenContainers(srcContainer, step.Copy.Src, stageContainer, dst); err != nil {
+						return fmt.Errorf("COPY --from=%s 失败: %w", step.Copy.From, err)
+					}
+				} else {
+					// 从宿主机复制
+					if err := applyCopyDst(client, stageContainer, step.Copy, contextDir, dst); err != nil {
+						return err
+					}
+				}
+			case "RUN":
+				cmd := step.Run
+				if workdir != "/" && workdir != "" {
+					cmd = "cd " + workdir + " && " + cmd
+				}
+				fmt.Printf("  [阶段%d %d/%d] RUN: %s\n", si+1, i+1, total, step.Run)
+				if err := client.ExecStreaming(stageContainer, cmd, runEnv); err != nil {
+					return fmt.Errorf("阶段 %d RUN 失败: %s\n  %w", si+1, step.Run, err)
+				}
+			}
+		}
+
+		// 持久化 ENV 到容器文件系统 (供镜像运行时使用)
+		if len(collectedEnvs) > 0 {
+			if err := applyEnvs(client, stageContainer, collectedEnvs); err != nil {
 				return err
 			}
-		case "RUN":
-			fmt.Printf("  [%d/%d] RUN: %s\n", i+1, total, s.Run)
-			if err := client.ExecStreaming(buildName, s.Run, runEnv); err != nil {
-				return fmt.Errorf("RUN 失败: %s\n  %w", s.Run, err)
+		}
+
+		// 最终阶段：停止并发布镜像
+		if isLast {
+			fmt.Printf("\n▶ [最终阶段] 停止并发布镜像 %s ...\n", alias)
+			if err := client.Stop(stageContainer); err != nil {
+				_ = client.StopForce(stageContainer)
 			}
+			properties := buildImageProperties(f)
+			if err := client.PublishImage(stageContainer, alias, properties); err != nil {
+				return fmt.Errorf("发布镜像失败: %w", err)
+			}
+			fmt.Printf("✔ 镜像已发布: %s\n", alias)
+		} else {
+			fmt.Printf("  ✔ 阶段 %q 完成 (保持运行供后续阶段引用)\n", stageLabel)
 		}
 	}
-
-	// 将所有 ENV 持久化到容器文件系统 (供镜像运行时使用)
-	if len(collectedEnvs) > 0 {
-		if err := applyEnvs(client, buildName, collectedEnvs); err != nil {
-			return err
-		}
-	}
-
-	// 停止构建容器，准备发布镜像
-	fmt.Printf("▶ [4/4] 停止构建容器并发布镜像 ...\n")
-	if err := client.Stop(buildName); err != nil {
-		return fmt.Errorf("停止构建容器失败: %w", err)
-	}
-
-	// 发布为本地镜像
-	fmt.Printf("▶ 发布镜像 %s ...\n", alias)
-	properties := buildImageProperties(f)
-	if err := client.PublishImage(buildName, alias, properties); err != nil {
-		return fmt.Errorf("发布镜像失败: %w", err)
-	}
-	fmt.Printf("✔ 镜像已发布: %s\n", alias)
 	return nil
+}
+
+// stageNames 返回可用阶段名列表 (用于错误提示)
+func stageNames(stages []Stage, before int) []string {
+	var names []string
+	for i := 0; i < before && i < len(stages); i++ {
+		if stages[i].Name != "" {
+			names = append(names, stages[i].Name)
+		} else {
+			names = append(names, fmt.Sprintf("%d", i))
+		}
+	}
+	return names
 }
 
 // buildImageProperties 将 Incusfile 的运行时指令编码为镜像属性，供 sb_lxc run 读取。
@@ -467,13 +558,18 @@ func applyEnvs(client *IncusClient, name string, envs []EnvSpec) error {
 // applyCopy 执行单条 COPY 指令，src 相对于 Incusfile 所在目录。
 // 安全约束：解析后的 src 必须位于 contextDir 之内，拒绝路径穿越 (如 ../../etc/passwd)。
 func applyCopy(client *IncusClient, name string, cp CopySpec, contextDir string) error {
+	return applyCopyDst(client, name, cp, contextDir, cp.Dst)
+}
+
+// applyCopyDst 与 applyCopy 相同，但使用调用方已解析的 dst (已结合 WORKDIR)。
+// 用于多阶段构建中 WORKDIR 影响目标路径的场景。
+func applyCopyDst(client *IncusClient, name string, cp CopySpec, contextDir, dst string) error {
 	src := cp.Src
 	if !filepath.IsAbs(src) {
 		src = filepath.Join(contextDir, src)
 	}
 	src = filepath.Clean(src)
 	// 路径穿越防护：src 必须位于 contextDir 之内
-	// 注意 src 与 contextDir 都必须转为绝对路径，否则 filepath.Rel 会报错误判。
 	absContext, err := filepath.Abs(contextDir)
 	if err != nil {
 		return fmt.Errorf("解析 contextDir 失败: %w", err)
@@ -486,7 +582,7 @@ func applyCopy(client *IncusClient, name string, cp CopySpec, contextDir string)
 	if err != nil || strings.HasPrefix(rel, "..") {
 		return fmt.Errorf("COPY 源 %q 位于构建上下文之外 (路径穿越被拒绝)", cp.Src)
 	}
-	return copyToContainer(client, name, absSrc, cp.Dst)
+	return copyToContainer(client, name, absSrc, dst)
 }
 
 // copyToContainer 将宿主机文件/目录复制到容器。目录会递归复制。
@@ -497,11 +593,27 @@ func copyToContainer(client *IncusClient, name, src, dst string) error {
 		return fmt.Errorf("源文件 %s 不存在: %w", src, err)
 	}
 	if info.IsDir() {
+		// 先创建目标根目录，保证后续子目录 mkdir -p 有父目录
+		dst = strings.TrimRight(dst, "/")
+		if dst != "" && dst != "/" {
+			if err := client.ExecStreaming(name, "mkdir -p "+dst, nil); err != nil {
+				return fmt.Errorf("创建目标目录 %s 失败: %w", dst, err)
+			}
+		}
 		return filepath.WalkDir(src, func(path string, d os.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return walkErr
 			}
 			if d.IsDir() {
+				// 在容器内创建对应子目录，确保后续文件 push 的父目录存在
+				rel, err := filepath.Rel(src, path)
+				if err != nil {
+					return err
+				}
+				targetDir := filepath.ToSlash(filepath.Join(dst, rel))
+				if err := client.ExecStreaming(name, "mkdir -p "+targetDir, nil); err != nil {
+					return fmt.Errorf("创建目标子目录 %s 失败: %w", targetDir, err)
+				}
 				return nil
 			}
 			// 拒绝符号链接，防止穿越
@@ -531,6 +643,23 @@ func pushFileToContainer(client *IncusClient, name, srcPath, dstPath string, mod
 	content, err := os.ReadFile(srcPath)
 	if err != nil {
 		return fmt.Errorf("读取 %s 失败: %w", srcPath, err)
+	}
+	// 规范化目标路径：去掉尾部 / (除非是根路径)
+	dstPath = strings.TrimRight(dstPath, "/")
+	if dstPath == "" {
+		dstPath = "/"
+	}
+	// 判断目标是否是目录：
+	// 1. 显式以 / 结尾或为 . → 视为目录
+	// 2. 容器内 test -d 成功 → 是目录
+	// 是目录则追加源文件名作为最终目标
+	if strings.HasSuffix(dstPath, "/") || dstPath == "." {
+		dstPath = filepath.ToSlash(filepath.Join(dstPath, filepath.Base(srcPath)))
+	} else {
+		// 在容器内检查目标是否是已存在的目录
+		if _, err := client.execQuiet(name, "test", "-d", dstPath); err == nil {
+			dstPath = filepath.ToSlash(filepath.Join(dstPath, filepath.Base(srcPath)))
+		}
 	}
 	modeStr := fmt.Sprintf("%04o", mode.Perm())
 	return client.PushFile(name, dstPath, content, modeStr)

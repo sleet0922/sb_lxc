@@ -1,0 +1,61 @@
+# Nginx 静态站点 - 单阶段构建示例
+# 用最简单的链路验证 sb_lxc 容器构建能力：
+#   apt 装包 -> COPY 静态资源 -> 注册 systemd 服务 -> 暴露端口+域名
+#
+# 用法: sb_lxc build
+# 测试: curl http://nginx.test            (需宿主机 /etc/hosts 已写入域名)
+#       curl http://nginx.test/health
+
+# ─────────── 基础镜像 ───────────
+FROM debian/13
+NAME nginx-static
+
+# ─────────── 换清华 Debian 源 (debian/13 = trixie) ───────────
+RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources && \
+    printf 'deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie main contrib non-free non-free-firmware\n\
+deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie-updates main contrib non-free non-free-firmware\n\
+deb https://mirrors.tuna.tsinghua.edu.cn/debian-security/ trixie-security main contrib non-free non-free-firmware\n' \
+    > /etc/apt/sources.list
+
+# ─────────── 安装运行时依赖 ───────────
+# nginx-light:       轻量 nginx (够用于静态站点，体积比 nginx 全量小)
+# ca-certificates:   HTTPS 拉取/校验 (清华源已用 https)
+# curl procps:       健康检查与调试 (curl 调 /health, ps 查进程)
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        nginx-light ca-certificates curl procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# ─────────── 复制静态资源与 nginx 配置 ───────────
+COPY ./index.html /usr/share/nginx/html/index.html
+COPY ./nginx.conf /etc/nginx/nginx.conf
+
+# ─────────── 注册 systemd 服务 ───────────
+# 容器启动后由 systemd 自动拉起 nginx-static 服务
+# ExecStartPre 先校验配置语法，避免错误配置把 nginx 拉起后立即崩
+# nginx -g 'daemon off;' 需要单引号，用 "'"'...'"'"' 模式嵌入单引号
+RUN printf '[Unit]\n\
+Description=Nginx Static Site (sb_lxc)\n\
+After=network.target\n\
+\n\
+[Service]\n\
+Type=simple\n\
+ExecStartPre=/usr/sbin/nginx -t\n\
+ExecStart=/usr/sbin/nginx -g '"'"'daemon off;'"'"'\n\
+Restart=on-failure\n\
+RestartSec=3\n\
+StandardOutput=journal\n\
+StandardError=journal\n\
+\n\
+[Install]\n\
+WantedBy=multi-user.target\n' > /etc/systemd/system/nginx-static.service && \
+    systemctl enable nginx-static.service
+
+# ─────────── 禁用 nginx 包自带默认服务 ───────────
+# apt 装 nginx-light 会注册并 enable 默认 nginx.service，会和我们的 nginx-static
+# 抢 80 端口。这里禁用默认服务，只让 nginx-static 接管。
+RUN systemctl disable nginx.service 2>/dev/null || true
+
+# ─────────── 运行时配置 ───────────
+EXPOSE 80/tcp
+DOMAIN nginx.test
+AUTOSTART on

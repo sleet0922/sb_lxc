@@ -1,6 +1,8 @@
 # Build artifacts
 /dist/
 /sb_lxc
+/sb_lxc.exe
+/sb_lxc_linux
 *.deb
 
 # Go test/build output

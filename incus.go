@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -977,6 +978,77 @@ func (c *IncusClient) ReadFile(name, path string) (string, error) {
 		return "", err
 	}
 	return string(data), nil
+}
+
+// CopyBetweenContainers 从源容器复制文件/目录到目标容器。
+// 通过 tar 流中转：在源容器内 tar 打包到 stdout，在目标容器内从 stdin 解压。
+// 两个容器都必须处于运行状态 (exec 依赖容器运行)。
+//
+// srcPath: 源容器内绝对路径
+// dstPath: 目标容器内绝对路径 (父目录会自动创建)
+//
+// 行为：把 srcPath 复制为 dstPath (类似 cp -r src dst)。
+// 如果 dstPath 的 basename 与 srcPath 的 basename 不同，会在解压后重命名。
+func (c *IncusClient) CopyBetweenContainers(srcName, srcPath, dstName, dstPath string) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	if !strings.HasPrefix(srcPath, "/") {
+		return fmt.Errorf("源路径必须是绝对路径: %s", srcPath)
+	}
+	if !strings.HasPrefix(dstPath, "/") {
+		dstPath = "/" + dstPath
+	}
+	srcDir := filepath.Dir(srcPath)
+	srcBase := filepath.Base(srcPath)
+	dstDir := filepath.Dir(dstPath)
+	dstBase := filepath.Base(dstPath)
+
+	// 1. 在源容器 tar 打包到 stdout
+	srcCmd := fmt.Sprintf("cd %s && tar cf - %s 2>/dev/null", srcDir, srcBase)
+	req := api.InstanceExecPost{
+		Command:     []string{"/bin/sh", "-c", srcCmd},
+		Environment: defaultExecEnv(),
+		WaitForWS:   true,
+		Interactive: false,
+	}
+	var buf bytes.Buffer
+	op, err := c.server.ExecInstance(srcName, req, &incus.InstanceExecArgs{
+		Stdin: strings.NewReader(""), Stdout: &buf, Stderr: io.Discard,
+	})
+	if err != nil {
+		return fmt.Errorf("从源容器 %s 打包失败: %w", srcName, err)
+	}
+	if exitCode, _ := execExitCode(op); exitCode != 0 {
+		return fmt.Errorf("源容器 tar 打包失败, 退出码 %d (路径 %s 不存在?)", exitCode, srcPath)
+	}
+
+	// 2. 在目标容器从 stdin 解压
+	dstCmd := fmt.Sprintf("mkdir -p %s && tar xf - -C %s 2>/dev/null", dstDir, dstDir)
+	req2 := api.InstanceExecPost{
+		Command:     []string{"/bin/sh", "-c", dstCmd},
+		Environment: defaultExecEnv(),
+		WaitForWS:   true,
+		Interactive: false,
+	}
+	op2, err := c.server.ExecInstance(dstName, req2, &incus.InstanceExecArgs{
+		Stdin: bytes.NewReader(buf.Bytes()), Stdout: io.Discard, Stderr: os.Stderr,
+	})
+	if err != nil {
+		return fmt.Errorf("向目标容器 %s 解压失败: %w", dstName, err)
+	}
+	if exitCode, _ := execExitCode(op2); exitCode != 0 {
+		return fmt.Errorf("目标容器 tar 解压失败, 退出码 %d", exitCode)
+	}
+
+	// 3. 如果 srcBase != dstBase，重命名
+	if srcBase != dstBase {
+		renameCmd := fmt.Sprintf("mv %s/%s %s/%s", dstDir, srcBase, dstDir, dstBase)
+		if err := c.ExecStreaming(dstName, renameCmd, nil); err != nil {
+			return fmt.Errorf("重命名 %s -> %s 失败: %w", srcBase, dstBase, err)
+		}
+	}
+	return nil
 }
 
 // ExecStreaming 在容器内通过 /bin/sh -c 执行命令，stdout/stderr 实时输出到当前进程。

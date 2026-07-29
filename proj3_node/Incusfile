@@ -1,0 +1,85 @@
+# Node.js Todo API - 多阶段构建示例
+# 阶段 1: builder 用 Node.js 22 LTS 执行 npm install (含编译产物 node_modules)
+# 阶段 2: runtime 只装 apt nodejs 运行时，从 builder 复制 node_modules
+#
+# 用法: sb_lxc build
+# 测试: curl http://node.test/health        (需宿主机 /etc/hosts 已写入域名)
+#       curl http://node.test/api/todos
+
+# === 阶段 1: builder (npm install) ===
+FROM debian/13 AS builder
+
+# 换清华源加速 apt (debian/13 = trixie)
+RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources && \
+    printf 'deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie main contrib non-free non-free-firmware\n\
+deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie-updates main contrib non-free non-free-firmware\n\
+deb https://mirrors.tuna.tsinghua.edu.cn/debian-security/ trixie-security main contrib non-free non-free-firmware\n' \
+    > /etc/apt/sources.list
+
+# curl/xz-utils: 下载并解压 Node 二进制; ca-certificates: HTTPS
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        curl xz-utils ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node.js 22 LTS (npmmirror.com 镜像) + npm 换淘宝源
+RUN curl -fsSL https://npmmirror.com/mirrors/node/v22.11.0/node-v22.11.0-linux-x64.tar.xz | tar -xJ -C /usr/local && \
+    ln -sf /usr/local/node-v22.11.0-linux-x64/bin/node /usr/local/bin/node && \
+    ln -sf /usr/local/node-v22.11.0-linux-x64/bin/npm /usr/local/bin/npm && \
+    npm config set registry https://registry.npmmirror.com
+
+WORKDIR /app
+
+# 先复制依赖清单 (利用层缓存: package.json 不变则复用 npm install 层)
+COPY ./package.json ./
+RUN npm install --production
+
+# === 阶段 2: 运行时 ===
+FROM debian/13
+NAME node-todo
+
+# 换清华源
+RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources && \
+    printf 'deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie main contrib non-free non-free-firmware\n\
+deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie-updates main contrib non-free non-free-firmware\n\
+deb https://mirrors.tuna.tsinghua.edu.cn/debian-security/ trixie-security main contrib non-free non-free-firmware\n' \
+    > /etc/apt/sources.list
+
+# 运行时依赖:
+# nodejs:          运行 Express 应用 (只跑不编译，apt 版本即可，Debian 13 自带 Node 20.x)
+# ca-certificates: HTTPS
+# curl procps:     健康检查与调试 (curl 调 /health, ps 查进程)
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        nodejs ca-certificates curl procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# 从 builder 复制 node_modules (含 builder 阶段 npm install 的产物)
+# express/redis 均为纯 JS 模块，无 native binding，Node 20 运行 Node 22 装出的包无 ABI 问题
+COPY --from=builder /app /app
+
+# 复制应用源码 (server.js 不在 builder 的 /app 中，需单独从宿主机复制)
+COPY ./server.js /app/server.js
+
+# 注册 systemd 服务，容器启动后由 systemd 自动拉起
+RUN printf '[Unit]\n\
+Description=Node Todo API (sb_lxc)\n\
+After=network.target\n\
+\n\
+[Service]\n\
+Type=simple\n\
+ExecStart=/usr/bin/node /app/server.js\n\
+WorkingDirectory=/app\n\
+Restart=on-failure\n\
+RestartSec=3\n\
+StandardOutput=journal\n\
+StandardError=journal\n\
+\n\
+[Install]\n\
+WantedBy=multi-user.target\n' > /etc/systemd/system/node-todo.service && \
+    systemctl enable node-todo.service
+
+ENV NODE_ENV=production
+
+# ─────────── 运行时配置 ───────────
+EXPOSE 3000/tcp
+DOMAIN node.test
+AUTOSTART on
