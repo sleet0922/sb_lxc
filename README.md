@@ -122,11 +122,11 @@ sb_lxc - Incus 容器管理工具 v1.3.0
   sb_lxc import  [文件] [名]  | 从 tar.gz 导入容器
 
 容器设置 (sb_lxc set <容器名> ...):
-  port [规格]                 | 端口映射 (规格如 8080:80/tcp)
-  port rm <规格>              | 取消端口映射
-  port list                   | 查看端口映射
-  domain <域名>               | 域名映射 (写入 /etc/hosts)
-  autostart [on|off]          | 开机自启动
+  sb_lxc set <容器名> port [规格]      | 端口映射 (规格如 8080:80/tcp)
+  sb_lxc set <容器名> port rm <规格>   | 取消端口映射
+  sb_lxc set <容器名> port list        | 查看端口映射
+  sb_lxc set <容器名> domain <域名>    | 域名映射 (写入 /etc/hosts)
+  sb_lxc set <容器名> autostart [on|off] | 开机自启动
 
 镜像构建 (类似 Dockerfile):
   sb_lxc build [Incusfile]               | 构建镜像 (默认 ./Incusfile)
