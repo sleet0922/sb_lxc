@@ -32,7 +32,7 @@
 - **域名映射**：容器域名 → IP 自动写入宿主机 `/etc/hosts`，容器重启后自动更新
 - **开机自启动**：一条命令配置 `boot.autostart`
 - **备份与恢复**：`export` 导出容器为 tar.gz，`import` 一键还原
-- **Dockerfile 风格镜像构建**：`Incusfile` 支持 `FROM / RUN / COPY / ENV / EXPOSE / DOMAIN / AUTOSTART` 指令，`sb_lxc build` 构建镜像，`sb_lxc run` 启动容器
+- **Dockerfile 风格镜像构建**：`Incusfile` 支持 `FROM / RUN / COPY / ENV / EXPOSE / DOMAIN / AUTOSTART / TEMP` 指令，`sb_lxc build` 构建镜像，`sb_lxc create` 创建+启动容器，`sb_lxc images` 列出本地镜像
 - **自动清理**：启动时自动删除未被引用的 Incus 托管网桥（如默认 `incusbr0`），释放 53 端口和网段
 - **跨平台编译**：纯 Go 实现，单二进制文件，Linux amd64 / arm64 一键交叉编译
 
@@ -60,7 +60,8 @@ sb_lxc in alpine-3-21
 # 6. 构建镜像并启动（Dockerfile 体验）
 cd my-project/
 sb_lxc build      # 构建镜像
-sb_lxc run        # 启动容器
+sb_lxc create     # 创建+启动容器
+sb_lxc images     # 列出本地镜像
 ```
 
 ---
@@ -131,7 +132,8 @@ sb_lxc - Incus 容器管理工具 v1.3.0
 镜像构建 (类似 Dockerfile):
   sb_lxc build [Incusfile]               | 构建镜像 (默认 ./Incusfile)
   sb_lxc build --name <名> [Incusfile]   | 覆盖镜像别名
-  sb_lxc run [容器名]                    | 从 ./Incusfile 读取镜像名并启动容器
+  sb_lxc create [容器名]                 | 从 ./Incusfile 读取镜像名并创建+启动容器
+  sb_lxc images                          | 列出本地镜像别名 (build 产物)
 
   Incusfile 指令:
     FROM <镜像>   NAME <名称>     RUN <命令>
@@ -283,11 +285,14 @@ sb_lxc build --name my-app
 # 指定 Incusfile 路径
 sb_lxc build path/to/MyIncusfile
 
-# 从 ./Incusfile 读取镜像名并启动容器（EXPOSE/DOMAIN/AUTOSTART 取自 Incusfile）
-sb_lxc run
+# 从 ./Incusfile 读取镜像名并创建+启动容器（EXPOSE/DOMAIN/AUTOSTART 取自 Incusfile）
+sb_lxc create
 
 # 启动时覆盖容器名
-sb_lxc run my-container
+sb_lxc create my-container
+
+# 列出本地镜像别名 (build 产物)
+sb_lxc images
 ```
 
 ### 完整示例：一键构建 Nginx 站点
@@ -321,7 +326,7 @@ AUTOSTART on
 ```bash
 cd my-site/
 sb_lxc build      # 构建镜像
-sb_lxc run        # 从 ./Incusfile 读取镜像名并启动容器
+sb_lxc create     # 从 ./Incusfile 读取镜像名并创建+启动容器
 ```
 
 输出：

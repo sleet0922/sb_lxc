@@ -1086,7 +1086,7 @@ func (c *IncusClient) ExecStreaming(name, command string, extraEnv map[string]st
 }
 
 // PublishImage 将容器发布为本地 Incus 镜像，并设置别名。
-// properties 会作为镜像属性存储，供 sb_lxc run 读取以恢复 EXPOSE/DOMAIN/AUTOSTART。
+// properties 会作为镜像属性存储，供 sb_lxc create 读取以恢复 EXPOSE/DOMAIN/AUTOSTART。
 func (c *IncusClient) PublishImage(containerName, alias string, properties map[string]string) error {
 	if err := c.ready(); err != nil {
 		return err
@@ -1178,7 +1178,7 @@ func (c *IncusClient) ReplaceImageAlias(alias string) error {
 }
 
 // ListLocalImageAliases 列出本地所有镜像别名 (含 sb_lxc 构建的镜像)。
-// 用于 sb_lxc run 的交互式选择。
+// 用于 sb_lxc create 的交互式选择。
 func (c *IncusClient) ListLocalImageAliases() ([]string, error) {
 	if err := c.ready(); err != nil {
 		return nil, err
@@ -1192,6 +1192,37 @@ func (c *IncusClient) ListLocalImageAliases() ([]string, error) {
 		names = append(names, a.Name)
 	}
 	return names, nil
+}
+
+// ImageAliasInfo 是带详情的本地镜像别名信息 (供 sb_lxc images 展示)。
+type ImageAliasInfo struct {
+	Name      string
+	Target    string    // 镜像指纹 (fingerprint)
+	Size      int64     // 镜像大小 (字节)
+	CreatedAt time.Time // 镜像创建时间
+}
+
+// ListLocalImageAliasesWithDetails 列出本地镜像别名及其详情 (大小/时间/指纹)。
+// 别名按名称升序排列。读取单个镜像详情失败时跳过该别名而非整体失败 (镜像可能已被手动删除)。
+func (c *IncusClient) ListLocalImageAliasesWithDetails() ([]ImageAliasInfo, error) {
+	if err := c.ready(); err != nil {
+		return nil, err
+	}
+	aliases, err := c.server.GetImageAliases()
+	if err != nil {
+		return nil, err
+	}
+	infos := make([]ImageAliasInfo, 0, len(aliases))
+	for _, a := range aliases {
+		info := ImageAliasInfo{Name: a.Name, Target: a.Target}
+		if img, _, err := c.server.GetImage(a.Target); err == nil && img != nil {
+			info.Size = img.Size
+			info.CreatedAt = img.UploadedAt
+		}
+		infos = append(infos, info)
+	}
+	sort.Slice(infos, func(i, j int) bool { return infos[i].Name < infos[j].Name })
+	return infos, nil
 }
 
 // GetImageAliasEntry 查询镜像别名是否存在, 存在返回其指向的 fingerprint。

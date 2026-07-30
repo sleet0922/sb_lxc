@@ -11,7 +11,7 @@ import (
 )
 
 // CmdBuild 从 Incusfile 构建镜像 (类似 docker build)。
-// 构建完成后用 'sb_lxc run' 启动容器。
+// 构建完成后用 'sb_lxc create' 启动容器。
 //
 // 用法:
 //
@@ -100,7 +100,7 @@ func CmdBuild(args []string) error {
 	}
 
 	fmt.Printf("\n✔ 镜像 %s 构建完成\n", alias)
-	fmt.Printf("  使用 'sb_lxc run' 启动容器\n")
+	fmt.Printf("  使用 'sb_lxc create' 启动容器\n")
 	return nil
 }
 
@@ -112,7 +112,7 @@ func buildUsage() string {
   sb_lxc build --name <name> [Incusfile]  覆盖镜像别名
   sb_lxc build show                       列出可用于 FROM 的基础镜像
 
-构建完成后用 'sb_lxc run' 启动容器。
+构建完成后用 'sb_lxc create' 启动容器。
 
 Incusfile 指令:
   FROM <image> [AS <name>]   基础镜像，开始新构建阶段 (多阶段)
@@ -437,7 +437,7 @@ func stageNames(stages []Stage, before int) []string {
 	return names
 }
 
-// buildImageProperties 将 Incusfile 的运行时指令编码为镜像属性，供 sb_lxc run 读取。
+// buildImageProperties 将 Incusfile 的运行时指令编码为镜像属性，供 sb_lxc create 读取。
 func buildImageProperties(f *Incusfile) map[string]string {
 	p := map[string]string{}
 	if f.Name != "" {
@@ -679,17 +679,17 @@ func pushFileToContainer(client *IncusClient, name, srcPath, dstPath string, mod
 	return client.PushFile(name, dstPath, content, modeStr)
 }
 
-// CmdRun 从 ./Incusfile 读取镜像别名并启动容器 (类似 docker run)。
+// CmdCreate 从 ./Incusfile 读取镜像别名并创建+启动容器 (类似 docker run)。
 // 镜像必须已由 'sb_lxc build' 构建完成。EXPOSE/DOMAIN/AUTOSTART 直接取自 Incusfile。
 //
 // 用法:
 //
-//	sb_lxc run [容器名]   从 ./Incusfile 读取镜像名并启动容器
-func CmdRun(args []string) error {
+//	sb_lxc create [容器名]   从 ./Incusfile 读取镜像名并创建+启动容器
+func CmdCreate(args []string) error {
 	// 从当前目录的 Incusfile 读取
 	f, err := parseIncusfile("")
 	if err != nil {
-		return fmt.Errorf("读取 ./Incusfile 失败: %w\n提示: sb_lxc run 从当前目录的 Incusfile 读取镜像名，请先创建 Incusfile 并用 'sb_lxc build' 构建镜像", err)
+		return fmt.Errorf("读取 ./Incusfile 失败: %w\n提示: sb_lxc create 从当前目录的 Incusfile 读取镜像名，请先创建 Incusfile 并用 'sb_lxc build' 构建镜像", err)
 	}
 
 	alias := f.Name

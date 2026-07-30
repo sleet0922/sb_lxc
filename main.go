@@ -6,7 +6,7 @@ import (
 )
 
 // Version 工具版本
-const Version = "1.8.0"
+const Version = "1.8.1"
 
 // MirrorRemote 镜像源在本地的 remote 名称
 const MirrorRemote = "mirror-images"
@@ -86,10 +86,14 @@ func dispatch(cmd string, args []string) error {
 		return CmdRemove([]string{"container"})
 	case "build":
 		return CmdBuild(args)
+	case "create":
+		return CmdCreate(args)
 	case "run":
-		return CmdRun(args)
-	case "image", "img":
-		return CmdImage(args)
+		// 旧别名兼容
+		fmt.Println("提示: run 已改名为 create, 用法: sb_lxc create [容器名]")
+		return CmdCreate(args)
+	case "images", "image":
+		return CmdImages(args)
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
@@ -165,7 +169,8 @@ func printUsage() {
   sb_lxc build [Incusfile]               | 构建镜像 (默认 ./Incusfile)
   sb_lxc build --name <名> [Incusfile]   | 覆盖镜像别名
   sb_lxc build show                      | 列出可用的基础镜像
-  sb_lxc run [容器名]                    | 从 ./Incusfile 读取镜像名并启动容器
+  sb_lxc create [容器名]                 | 从 ./Incusfile 读取镜像名并创建+启动容器
+  sb_lxc images                          | 列出本地镜像别名 (build 产物)
 
   Incusfile 指令:
     FROM <镜像>   NAME <名称>     RUN <命令>
@@ -180,15 +185,57 @@ func printUsage() {
 `, Version)
 }
 
-// CmdImage 镜像子命令分发 (目前仅 build 别名)。
-func CmdImage(args []string) error {
-	if len(args) < 1 {
-		return fmt.Errorf("用法: sb_lxc image build [Incusfile]")
+// CmdImages 列出本地镜像别名 (sb_lxc build 的产物)。
+// 显示别名、镜像指纹(短)、大小、创建时间。
+func CmdImages(args []string) error {
+	client := NewIncusClient()
+	infos, err := client.ListLocalImageAliasesWithDetails()
+	if err != nil {
+		return fmt.Errorf("读取本地镜像列表失败: %w", err)
 	}
-	switch args[0] {
-	case "build":
-		return CmdBuild(args[1:])
+	if len(infos) == 0 {
+		fmt.Println("本地无镜像别名。用 'sb_lxc build' 构建镜像。")
+		return nil
+	}
+	fmt.Printf("╭─ 本地镜像 (共 %d 个)\n", len(infos))
+	fmt.Println("│ 别名                          大小      创建时间          指纹(短)")
+	fmt.Println("│ ──────────────────────────── ──────── ──────────────── ────────────")
+	for _, info := range infos {
+		fp := info.Target
+		if len(fp) > 12 {
+			fp = fp[:12]
+		}
+		fmt.Printf("│ %-29s %-8s %-16s %s\n", truncName(info.Name, 29), humanSize(info.Size), info.CreatedAt.Format("2006-01-02 15:04"), fp)
+	}
+	fmt.Println("╰─")
+	return nil
+}
+
+func truncName(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-1] + "…"
+}
+
+func humanSize(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%dB", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	switch exp {
+	case 0:
+		return fmt.Sprintf("%.1fK", float64(bytes)/float64(div))
+	case 1:
+		return fmt.Sprintf("%.1fM", float64(bytes)/float64(div))
+	case 2:
+		return fmt.Sprintf("%.1fG", float64(bytes)/float64(div))
 	default:
-		return fmt.Errorf("未知子命令: sb_lxc image %s (支持: build)", args[0])
+		return fmt.Sprintf("%.1fT", float64(bytes)/float64(div))
 	}
 }
