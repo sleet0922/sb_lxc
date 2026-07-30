@@ -678,11 +678,26 @@ func pushFileToContainer(client *IncusClient, name, srcPath, dstPath string, mod
 //
 //	sb_lxc run <镜像别名> [容器名]
 func CmdRun(args []string) error {
-	if len(args) < 1 {
-		return fmt.Errorf("用法: sb_lxc run <镜像别名> [容器名]")
-	}
-	alias := args[0]
+	alias := ""
 	name := ""
+	if len(args) >= 1 {
+		alias = args[0]
+	} else {
+		// 交互式选择本地镜像别名
+		client := NewIncusClient()
+		aliases, err := client.ListLocalImageAliases()
+		if err != nil {
+			return fmt.Errorf("读取本地镜像列表失败: %w", err)
+		}
+		if len(aliases) == 0 {
+			return fmt.Errorf("本地无镜像别名。请先用 sb_lxc build 构建镜像")
+		}
+		choice := selectMenu(aliases, "选择要启动的镜像 (↑↓ 选择, Enter 确认, q 退出)")
+		if choice < 0 {
+			return nil
+		}
+		alias = aliases[choice]
+	}
 	if len(args) >= 2 {
 		name = args[1]
 	}

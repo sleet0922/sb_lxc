@@ -1177,6 +1177,23 @@ func (c *IncusClient) ReplaceImageAlias(alias string) error {
 	return nil
 }
 
+// ListLocalImageAliases 列出本地所有镜像别名 (含 sb_lxc 构建的镜像)。
+// 用于 sb_lxc run 的交互式选择。
+func (c *IncusClient) ListLocalImageAliases() ([]string, error) {
+	if err := c.ready(); err != nil {
+		return nil, err
+	}
+	aliases, err := c.server.GetImageAliases()
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(aliases))
+	for _, a := range aliases {
+		names = append(names, a.Name)
+	}
+	return names, nil
+}
+
 // GetImageProperties 读取本地镜像 (通过别名) 的属性。
 func (c *IncusClient) GetImageProperties(alias string) (map[string]string, error) {
 	if err := c.ready(); err != nil {
