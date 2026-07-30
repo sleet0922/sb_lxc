@@ -852,7 +852,6 @@ func (c *IncusClient) ListImages() ([]DistroGroup, error) {
 		return nil, fmt.Errorf("获取镜像列表失败: %w", err)
 	}
 	arch := archName() // 动态获取当前主机架构，支持 amd64/arm64
-	allowedDistros := map[string]bool{"alpine": true, "centos": true, "debian": true, "nixos": true, "ubuntu": true, "oracle": true, "rockylinux": true}
 	grouped := map[string]map[string]string{}
 	distroOrder := []string{}
 	for _, img := range images {
@@ -864,9 +863,6 @@ func (c *IncusClient) ListImages() ([]DistroGroup, error) {
 			continue
 		}
 		osKey, relKey := strings.ToLower(osName), strings.ToLower(release)
-		if !allowedDistros[osKey] {
-			continue
-		}
 		shortest := ""
 		for _, alias := range img.Aliases {
 			if shortest == "" || len(alias.Name) < len(shortest) {
