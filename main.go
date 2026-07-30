@@ -6,7 +6,7 @@ import (
 )
 
 // Version 工具版本
-const Version = "1.7.1"
+const Version = "1.8.0"
 
 // MirrorRemote 镜像源在本地的 remote 名称
 const MirrorRemote = "mirror-images"
@@ -171,6 +171,7 @@ func printUsage() {
     FROM <镜像>   NAME <名称>     RUN <命令>
     COPY <源> <目标>   ENV <K=V>
     EXPOSE <端口>   DOMAIN <域名>   AUTOSTART on|off
+    TEMP <名称> ... END   临时构建块 (隔离编译工具链)
 
 其他:
   sb_lxc help                 | 显示此帮助

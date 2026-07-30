@@ -22,6 +22,9 @@ import (
 //	EXPOSE <port>[/<proto>] ...     声明端口映射 (运行时自动创建)
 //	DOMAIN <domain>                 域名映射 (运行时写入 /etc/hosts)
 //	AUTOSTART on|off                开机自启动
+//	TEMP <name> ... END             临时构建块: 块内步骤在独立临时容器执行，不进最终镜像
+//	    块继承外层 FROM 镜像，用于隔离编译工具链 (golang/nodejs) 污染
+//	    块名可用于 COPY --from=<name> 拷回构建产物；仅支持单 FROM (all-in-one 模式)
 type Incusfile struct {
 	Path   string
 	Stages []Stage
@@ -129,6 +132,13 @@ func parseIncusfile(path string) (*Incusfile, error) {
 	var currentStage *Stage
 	stageByName := map[string]int{}
 
+	// TEMP 块状态: TEMP <name> ... END 内的步骤在一个独立临时容器执行，
+	// 不进入最终镜像。常用于编译型语言 (golang/nodejs) 隔离构建工具链污染。
+	// TEMP 块在解析后转换为前置 Stage，复用外层 FROM 镜像，主 FROM 阶段作为最终阶段。
+	var tempStages []Stage
+	var inTemp bool
+	var currentTemp *Stage
+
 	startStage := func(fromImg, stageName string, lineNo int) error {
 		if fromImg == "" {
 			return fmt.Errorf("line %d: FROM 需要镜像引用", lineNo)
@@ -147,6 +157,14 @@ func parseIncusfile(path string) (*Incusfile, error) {
 		return nil
 	}
 
+	// targetStage 返回当前指令应作用的目标阶段: TEMP 块内返回临时阶段，否则返回主阶段。
+	targetStage := func() *Stage {
+		if inTemp {
+			return currentTemp
+		}
+		return currentStage
+	}
+
 	for _, ll := range logical {
 		lineNo := ll.no
 		raw := ll.text
@@ -162,77 +180,103 @@ func parseIncusfile(path string) (*Incusfile, error) {
 		payload := directivePayload(raw)
 		switch directive {
 		case "FROM":
+			if inTemp {
+				return nil, fmt.Errorf("line %d: TEMP 块内不能有 FROM", lineNo)
+			}
 			fromImg, stageName := parseFromPayload(payload)
 			if err := startStage(fromImg, stageName, lineNo); err != nil {
 				return nil, err
 			}
+		case "TEMP":
+			// TEMP <name> 开始一个临时构建块: 块内步骤在独立临时容器执行，不进最终镜像。
+			// 块继承外层 FROM 镜像。需用 END 关闭。块名可用于 COPY --from=<name>。
+			if inTemp {
+				return nil, fmt.Errorf("line %d: TEMP 不能嵌套", lineNo)
+			}
+			if currentStage == nil {
+				return nil, fmt.Errorf("line %d: TEMP 必须在 FROM 之后", lineNo)
+			}
+			name := payload
+			if name == "" {
+				return nil, fmt.Errorf("line %d: TEMP 需要名称 (如 TEMP builder)", lineNo)
+			}
+			inTemp = true
+			currentTemp = &Stage{Name: name, From: currentStage.From}
+		case "END":
+			// END 关闭最近的 TEMP 块。
+			if !inTemp {
+				return nil, fmt.Errorf("line %d: END 没有匹配的 TEMP", lineNo)
+			}
+			tempStages = append(tempStages, *currentTemp)
+			inTemp = false
+			currentTemp = nil
 		case "NAME":
 			if payload == "" {
 				return nil, fmt.Errorf("line %d: NAME 需要名称", lineNo)
 			}
 			f.Name = payload
 		case "WORKDIR":
-			if currentStage == nil {
+			if targetStage() == nil {
 				return nil, fmt.Errorf("line %d: WORKDIR 必须在 FROM 之后", lineNo)
 			}
 			if payload == "" {
 				return nil, fmt.Errorf("line %d: WORKDIR 需要路径", lineNo)
 			}
-			currentStage.Steps = append(currentStage.Steps, BuildStep{Kind: "WORKDIR", Workdir: payload})
+			targetStage().Steps = append(targetStage().Steps, BuildStep{Kind: "WORKDIR", Workdir: payload})
 		case "RUN":
-			if currentStage == nil {
+			if targetStage() == nil {
 				return nil, fmt.Errorf("line %d: RUN 必须在 FROM 之后", lineNo)
 			}
 			if payload == "" {
 				return nil, fmt.Errorf("line %d: RUN 需要命令", lineNo)
 			}
-			currentStage.Steps = append(currentStage.Steps, BuildStep{Kind: "RUN", Run: payload})
+			targetStage().Steps = append(targetStage().Steps, BuildStep{Kind: "RUN", Run: payload})
 		case "COPY":
-			if currentStage == nil {
+			if targetStage() == nil {
 				return nil, fmt.Errorf("line %d: COPY 必须在 FROM 之后", lineNo)
 			}
 			from, src, dst, err := parseCopyPayload(payload)
 			if err != nil {
 				return nil, fmt.Errorf("line %d: %w", lineNo, err)
 			}
-			currentStage.Steps = append(currentStage.Steps, BuildStep{Kind: "COPY", Copy: CopySpec{Src: src, Dst: dst, From: from}})
+			targetStage().Steps = append(targetStage().Steps, BuildStep{Kind: "COPY", Copy: CopySpec{Src: src, Dst: dst, From: from}})
 		case "ENV":
-			if currentStage == nil {
+			if targetStage() == nil {
 				return nil, fmt.Errorf("line %d: ENV 必须在 FROM 之后", lineNo)
 			}
 			kv, err := parseEnvPayload(payload)
 			if err != nil {
 				return nil, fmt.Errorf("line %d: %w", lineNo, err)
 			}
-			currentStage.Steps = append(currentStage.Steps, BuildStep{Kind: "ENV", Env: kv})
+			targetStage().Steps = append(targetStage().Steps, BuildStep{Kind: "ENV", Env: kv})
 		case "EXPOSE":
-			if currentStage == nil {
+			if targetStage() == nil {
 				return nil, fmt.Errorf("line %d: EXPOSE 必须在 FROM 之后", lineNo)
 			}
 			ports, err := parseExposePayload(payload)
 			if err != nil {
 				return nil, fmt.Errorf("line %d: %w", lineNo, err)
 			}
-			currentStage.Exposes = append(currentStage.Exposes, ports...)
+			targetStage().Exposes = append(targetStage().Exposes, ports...)
 		case "DOMAIN":
-			if currentStage == nil {
+			if targetStage() == nil {
 				return nil, fmt.Errorf("line %d: DOMAIN 必须在 FROM 之后", lineNo)
 			}
 			if payload == "" {
 				return nil, fmt.Errorf("line %d: DOMAIN 需要域名", lineNo)
 			}
-			currentStage.Domain = payload
+			targetStage().Domain = payload
 		case "AUTOSTART":
-			if currentStage == nil {
+			if targetStage() == nil {
 				return nil, fmt.Errorf("line %d: AUTOSTART 必须在 FROM 之后", lineNo)
 			}
 			on, err := parseBoolPayload(payload)
 			if err != nil {
 				return nil, fmt.Errorf("line %d: %w", lineNo, err)
 			}
-			currentStage.Autostart = &on
+			targetStage().Autostart = &on
 		default:
-			return nil, fmt.Errorf("line %d: 未知指令 %s (支持: FROM NAME WORKDIR RUN COPY ENV EXPOSE DOMAIN AUTOSTART)", lineNo, directive)
+			return nil, fmt.Errorf("line %d: 未知指令 %s (支持: FROM NAME WORKDIR RUN COPY ENV EXPOSE DOMAIN AUTOSTART TEMP END)", lineNo, directive)
 		}
 	}
 
@@ -242,6 +286,19 @@ func parseIncusfile(path string) (*Incusfile, error) {
 	}
 	if len(f.Stages) == 0 {
 		return nil, fmt.Errorf("%s 缺少 FROM 指令", path)
+	}
+
+	// TEMP 块后处理: 校验闭合 + 校验单 FROM + 转换为前置阶段
+	if inTemp {
+		return nil, fmt.Errorf("%s: TEMP 块未用 END 关闭", path)
+	}
+	if len(tempStages) > 0 {
+		// TEMP 块仅支持单 FROM (all-in-one 模式)；多 FROM 应直接用多阶段构建
+		if len(f.Stages) > 1 {
+			return nil, fmt.Errorf("%s: TEMP 块不支持多 FROM (多阶段构建请用 FROM ... AS, 不要混用 TEMP)", path)
+		}
+		// TEMP 块作为前置阶段，主 FROM 阶段作为最终阶段 (最后发布)
+		f.Stages = append(tempStages, f.Stages...)
 	}
 
 	// 同步最终阶段到顶层字段 (保持向后兼容，buildImageProperties 等函数直接读取)

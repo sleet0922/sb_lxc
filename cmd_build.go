@@ -124,6 +124,23 @@ Incusfile 指令:
   EXPOSE <port>[/<proto>]    声明端口映射
   DOMAIN <domain>            域名映射
   AUTOSTART on|off           开机自启动
+  TEMP <name> ... END        临时构建块 (隔离编译工具链, 不进最终镜像)
+
+TEMP 块示例 (单 FROM all-in-one, 编译产物隔离):
+  FROM debian/13
+  NAME my-app
+  RUN apt-get update && apt-get install -y ca-certificates mysql-server
+
+  TEMP builder
+    RUN apt-get update && apt-get install -y golang-go
+    WORKDIR /src
+    COPY ./main.go .
+    RUN go build -o app .
+  END
+
+  COPY --from=builder /src/app /usr/local/bin/app
+  EXPOSE 8080/tcp
+  AUTOSTART on
 
 多阶段构建示例 (分离构建环境与运行时):
   FROM debian/13 AS builder

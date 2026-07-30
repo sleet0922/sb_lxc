@@ -3,6 +3,7 @@
 /sb_lxc
 /sb_lxc.exe
 /sb_lxc_linux
+/sb-lxc_*
 *.deb
 
 # Go test/build output

@@ -137,6 +137,7 @@ sb_lxc - Incus 容器管理工具 v1.3.0
     FROM <镜像>   NAME <名称>     RUN <命令>
     COPY <源> <目标>   ENV <K=V>
     EXPOSE <端口>   DOMAIN <域名>   AUTOSTART on|off
+    TEMP <名称> ... END   临时构建块 (隔离编译工具链)
 
 其他:
   sb_lxc help                 | 显示此帮助
@@ -215,6 +216,7 @@ sb_lxc set web autostart off
 | `EXPOSE <端口>[/<协议>] ...` | 声明端口映射（运行时自动创建），空格分隔多个 | `EXPOSE 80/tcp 53/udp` |
 | `DOMAIN <域名>` | 域名映射（运行时写入 `/etc/hosts`） | `DOMAIN nginx.test` |
 | `AUTOSTART on\|off` | 开机自启动 | `AUTOSTART on` |
+| `TEMP <名称> ... END` | 临时构建块（块内步骤在独立临时容器执行，不进最终镜像，用于隔离编译工具链） | 见下方示例 |
 
 ### 指令执行顺序
 
@@ -226,6 +228,34 @@ COPY ./config.yaml /app/config/   # 再 COPY 到该目录
 ```
 
 `ENV` 设置的变量在后续 `RUN` 中即可使用，同时会持久化到镜像的 `/etc/environment` 和 `/etc/profile.d/sb_lxc-env.sh`。
+
+### TEMP 临时构建块
+
+`TEMP <名称> ... END` 定义一个临时构建块：块内的 `RUN`/`COPY`/`WORKDIR`/`ENV` 在一个**独立临时容器**中执行，**不进入最终镜像**。适用于隔离编译工具链（golang/nodejs 等）对运行时镜像的污染。
+
+- 块继承外层 `FROM` 镜像（单 FROM all-in-one 模式，不支持多 FROM 混用）
+- 块名可用于 `COPY --from=<块名>` 将构建产物拷回最终镜像
+- 多个 `TEMP` 块按出现顺序执行，均早于主阶段的步骤
+- 块必须用 `END` 关闭，不支持嵌套
+
+```dockerfile
+FROM debian/13
+NAME my-app
+RUN apt-get update && apt-get install -y ca-certificates mysql-server
+
+TEMP builder
+  RUN apt-get update && apt-get install -y golang-go
+  WORKDIR /src
+  COPY ./main.go .
+  RUN go build -o app .
+END
+
+COPY --from=builder /src/app /usr/local/bin/app
+EXPOSE 8080/tcp
+AUTOSTART on
+```
+
+上例中 `golang-go` 只装在 `builder` 临时容器里，最终镜像只有 `ca-certificates` + `mysql-server` + 编译好的 `app` 二进制。
 
 ### 构建流程
 
