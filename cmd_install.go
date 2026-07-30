@@ -92,5 +92,6 @@ func CmdInstall(args []string) error {
 func defaultNameFromImage(image string) string {
 	s := strings.ReplaceAll(image, "/", "-")
 	s = strings.ReplaceAll(s, ":", "-")
+	s = strings.ReplaceAll(s, ".", "-")
 	return strings.ToLower(s)
 }

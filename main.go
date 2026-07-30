@@ -6,7 +6,7 @@ import (
 )
 
 // Version 工具版本
-const Version = "1.8.1"
+const Version = "1.8.2"
 
 // MirrorRemote 镜像源在本地的 remote 名称
 const MirrorRemote = "mirror-images"
@@ -83,7 +83,7 @@ func dispatch(cmd string, args []string) error {
 	case "uninstall":
 		// 旧别名: 行为同 remove container (兼容老用户)
 		fmt.Println("提示: uninstall 已改名为 remove, 用法: sb_lxc remove container [名]")
-		return CmdRemove([]string{"container"})
+		return CmdRemove(append([]string{"container"}, args...))
 	case "build":
 		return CmdBuild(args)
 	case "create":
