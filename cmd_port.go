@@ -281,8 +281,8 @@ func (c *IncusClient) RemovePortMapping(name string, hostPort int, protocol stri
 //
 //	sb_lxc set <name> port                  交互式菜单
 //	sb_lxc set <name> port <spec>           添加/替换映射
-//	sb_lxc set <name> port --rm <spec>      移除映射
-//	sb_lxc set <name> port --list           列出映射
+//	sb_lxc set <name> port rm <spec>        移除映射
+//	sb_lxc set <name> port list             列出映射
 func cmdSetPort(client *IncusClient, ct *Container, args []string) error {
 	name := ct.Name
 
@@ -293,7 +293,7 @@ func cmdSetPort(client *IncusClient, ct *Container, args []string) error {
 			return printPortMappings(client, name)
 		case "--rm", "--unset", "rm", "unset", "remove", "del":
 			if len(args) < 2 {
-				return fmt.Errorf("用法: sb_lxc set %s port --rm <host_port[/proto]>", name)
+				return fmt.Errorf("用法: sb_lxc set %s port rm <host_port[/proto]>", name)
 			}
 			hostPort, _, proto, err := parsePortSpec(args[1])
 			if err != nil {

@@ -61,14 +61,53 @@ func CmdStart(name string) error {
 	return nil
 }
 
-// CmdUninstall 交互式选择并删除容器，并清理 /etc/hosts 与 /32 路由残留。
-func CmdUninstall() error {
-	name, err := selectContainer("选择要删除的容器")
-	if err != nil {
-		return err
+// CmdRemove 删除容器或镜像。
+// 用法:
+//
+//	sb_lxc remove                     # 交互式: 先选容器/镜像, 再选具体项
+//	sb_lxc remove container [名]      # 删容器 (省略名则交互式选择)
+//	sb_lxc remove image [别名]        # 删镜像 (省略别名则交互式选择)
+//	sb_lxc remove [容器名]            # 兼容旧语法 (无子目标时按容器处理)
+//
+// 旧命令 uninstall 作为别名保留, 行为同 remove container。
+func CmdRemove(args []string) error {
+	// 有子目标参数
+	if len(args) >= 1 {
+		sub := strings.ToLower(args[0])
+		switch sub {
+		case "container", "ct", "c":
+			return removeContainer(args[1:])
+		case "image", "img", "i":
+			return removeImage(args[1:])
+		}
+		// 兼容旧语法: 第一个参数像容器名 → 按容器处理
+		return removeContainer(args)
 	}
-	if name == "" {
+	// 无参数: 交互式选容器/镜像
+	choice := selectMenu([]string{"容器 (container)", "镜像 (image)"}, "选择要删除的对象类型 (↑↓ 选择, Enter 确认, q 退出)")
+	if choice < 0 {
 		return nil
+	}
+	if choice == 0 {
+		return removeContainer(nil)
+	}
+	return removeImage(nil)
+}
+
+// removeContainer 删除容器, 并清理 /etc/hosts 与 /32 路由残留。
+func removeContainer(args []string) error {
+	name := ""
+	if len(args) >= 1 {
+		name = args[0]
+	} else {
+		n, err := selectContainer("选择要删除的容器")
+		if err != nil {
+			return err
+		}
+		if n == "" {
+			return nil
+		}
+		name = n
 	}
 	client := NewIncusClient()
 	// 先获取容器信息用于清理路由
@@ -90,6 +129,45 @@ func CmdUninstall() error {
 		}
 	}
 	fmt.Printf("✔ 容器 %s 已删除\n", name)
+	return nil
+}
+
+// removeImage 删除镜像别名及其指向的镜像 (无其他别名引用时一并删镜像)。
+func removeImage(args []string) error {
+	alias := ""
+	if len(args) >= 1 {
+		alias = args[0]
+	} else {
+		client := NewIncusClient()
+		aliases, err := client.ListLocalImageAliases()
+		if err != nil {
+			return fmt.Errorf("读取本地镜像列表失败: %w", err)
+		}
+		if len(aliases) == 0 {
+			fmt.Println("本地无镜像别名。")
+			return nil
+		}
+		choice := selectMenu(aliases, "选择要删除的镜像 (↑↓ 选择, Enter 确认, q 退出)")
+		if choice < 0 {
+			return nil
+		}
+		alias = aliases[choice]
+	}
+	// 先验证别名存在 (DeleteImageByAlias 内部会再次校验, 这里提前报错避免无谓确认)
+	client := NewIncusClient()
+	if _, err := client.GetImageAliasEntry(alias); err != nil {
+		return fmt.Errorf("镜像别名 %s 不存在", alias)
+	}
+	// 二次确认
+	confirm := selectMenu([]string{"确认删除", "取消"}, fmt.Sprintf("确认删除镜像 %s? (↑↓ 选择, Enter 确认)", alias))
+	if confirm != 0 {
+		fmt.Println("已取消")
+		return nil
+	}
+	if err := client.DeleteImageByAlias(alias); err != nil {
+		return err
+	}
+	fmt.Printf("✔ 镜像 %s 已删除\n", alias)
 	return nil
 }
 

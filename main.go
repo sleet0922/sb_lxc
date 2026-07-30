@@ -6,7 +6,7 @@ import (
 )
 
 // Version 工具版本
-const Version = "1.6.5"
+const Version = "1.7.0"
 
 // MirrorRemote 镜像源在本地的 remote 名称
 const MirrorRemote = "mirror-images"
@@ -78,8 +78,12 @@ func dispatch(cmd string, args []string) error {
 		return CmdImport(args)
 	case "install", "i":
 		return CmdInstall(args)
-	case "uninstall", "rm":
-		return CmdUninstall()
+	case "remove", "rm":
+		return CmdRemove(args)
+	case "uninstall":
+		// 旧别名: 行为同 remove container (兼容老用户)
+		fmt.Println("提示: uninstall 已改名为 remove, 用法: sb_lxc remove container [名]")
+		return CmdRemove([]string{"container"})
 	case "build":
 		return CmdBuild(args)
 	case "run":
@@ -140,7 +144,8 @@ func printUsage() {
 容器管理:
   sb_lxc list                 | 列出已安装容器
   sb_lxc install              | 安装新容器 (交互式选择发行版)
-  sb_lxc uninstall            | 删除容器
+  sb_lxc remove [container|image] [名] | 删除容器或镜像 (交互式选择)
+  sb_lxc uninstall            | 删除容器 (旧别名, 等同 remove container)
   sb_lxc start   [容器名]     | 启动容器
   sb_lxc stop    [容器名]     | 停止容器
   sb_lxc restart [容器名]     | 重启容器
@@ -151,18 +156,16 @@ func printUsage() {
 
 容器设置 (sb_lxc set <容器名> ...):
   port [规格]                 | 端口映射 (规格如 8080:80/tcp)
-  port --rm <规格>            | 取消端口映射
-  port --list                 | 查看端口映射
+  port rm <规格>              | 取消端口映射
+  port list                   | 查看端口映射
   domain <域名>               | 域名映射 (写入 /etc/hosts)
   autostart [on|off]          | 开机自启动
 
 镜像构建 (类似 Dockerfile):
-  sb_lxc build [Incusfile]               | 构建镜像并启动容器 (一键)
-  sb_lxc build --image-only [Incusfile]  | 只构建镜像不启动
-  sb_lxc build --name <名> [Incusfile]   | 覆盖镜像/容器名
+  sb_lxc build [Incusfile]               | 构建镜像 (默认 ./Incusfile)
+  sb_lxc build --name <名> [Incusfile]   | 覆盖镜像别名
   sb_lxc build show                      | 列出可用的基础镜像
-  sb_lxc run <镜像> [容器名]             | 从已构建镜像启动容器
-  sb_lxc image init [路径]               | 交互式生成 Incusfile
+  sb_lxc run [容器名]                    | 从 ./Incusfile 读取镜像名并启动容器
 
   Incusfile 指令:
     FROM <镜像>   NAME <名称>     RUN <命令>
@@ -176,17 +179,15 @@ func printUsage() {
 `, Version)
 }
 
-// CmdImage 镜像子命令分发 (目前仅 init)。
+// CmdImage 镜像子命令分发 (目前仅 build 别名)。
 func CmdImage(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("用法: sb_lxc image init [路径]")
+		return fmt.Errorf("用法: sb_lxc image build [Incusfile]")
 	}
 	switch args[0] {
-	case "init", "new", "create":
-		return CmdImageInit(args[1:])
 	case "build":
 		return CmdBuild(args[1:])
 	default:
-		return fmt.Errorf("未知子命令: sb_lxc image %s (支持: init, build)", args[0])
+		return fmt.Errorf("未知子命令: sb_lxc image %s (支持: build)", args[0])
 	}
 }

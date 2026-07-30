@@ -32,8 +32,7 @@
 - **域名映射**：容器域名 → IP 自动写入宿主机 `/etc/hosts`，容器重启后自动更新
 - **开机自启动**：一条命令配置 `boot.autostart`
 - **备份与恢复**：`export` 导出容器为 tar.gz，`import` 一键还原
-- **Dockerfile 风格镜像构建**：`Incusfile` 支持 `FROM / RUN / COPY / ENV / EXPOSE / DOMAIN / AUTOSTART` 指令，`sb_lxc build` 一键构建并启动
-- **交互式向导**：`sb_lxc image init` 引导生成 Incusfile，零基础也能上手
+- **Dockerfile 风格镜像构建**：`Incusfile` 支持 `FROM / RUN / COPY / ENV / EXPOSE / DOMAIN / AUTOSTART` 指令，`sb_lxc build` 构建镜像，`sb_lxc run` 启动容器
 - **自动清理**：启动时自动删除未被引用的 Incus 托管网桥（如默认 `incusbr0`），释放 53 端口和网段
 - **跨平台编译**：纯 Go 实现，单二进制文件，Linux amd64 / arm64 一键交叉编译
 
@@ -58,9 +57,10 @@ sb_lxc list
 # 5. 进入容器
 sb_lxc in alpine-3-21
 
-# 6. 一键构建并启动（Dockerfile 体验）
+# 6. 构建镜像并启动（Dockerfile 体验）
 cd my-project/
-sb_lxc build
+sb_lxc build      # 构建镜像
+sb_lxc run        # 启动容器
 ```
 
 ---
@@ -123,17 +123,15 @@ sb_lxc - Incus 容器管理工具 v1.3.0
 
 容器设置 (sb_lxc set <容器名> ...):
   port [规格]                 | 端口映射 (规格如 8080:80/tcp)
-  port --rm <规格>            | 取消端口映射
-  port --list                 | 查看端口映射
+  port rm <规格>              | 取消端口映射
+  port list                   | 查看端口映射
   domain <域名>               | 域名映射 (写入 /etc/hosts)
   autostart [on|off]          | 开机自启动
 
 镜像构建 (类似 Dockerfile):
-  sb_lxc build [Incusfile]               | 构建镜像并启动容器 (一键)
-  sb_lxc build --image-only [Incusfile]  | 只构建镜像不启动
-  sb_lxc build --name <名> [Incusfile]   | 覆盖镜像/容器名
-  sb_lxc run <镜像> [容器名]             | 从已构建镜像启动容器
-  sb_lxc image init [路径]               | 交互式生成 Incusfile
+  sb_lxc build [Incusfile]               | 构建镜像 (默认 ./Incusfile)
+  sb_lxc build --name <名> [Incusfile]   | 覆盖镜像别名
+  sb_lxc run [容器名]                    | 从 ./Incusfile 读取镜像名并启动容器
 
   Incusfile 指令:
     FROM <镜像>   NAME <名称>     RUN <命令>
@@ -173,8 +171,8 @@ sb_lxc set web port 8080:80/tcp     # 宿主机 8080 → 容器 80
 sb_lxc set web port 53/udp          # 宿主机 53 → 容器 53 (UDP)
 sb_lxc set web port 8080:80/tcp     # 再次执行 → 替换原有映射 (幂等)
 
-sb_lxc set web port --list          # 查看所有映射
-sb_lxc set web port --rm 8080:80/tcp  # 删除指定映射
+sb_lxc set web port list            # 查看所有映射
+sb_lxc set web port rm 8080:80/tcp   # 删除指定映射
 
 # 域名映射：自动写入宿主机 /etc/hosts
 sb_lxc set web domain web.test      # web.test → 容器 IP
@@ -246,24 +244,20 @@ sb_lxc build
 ### 命令
 
 ```bash
-# 一键构建并启动（最常用）
-sb_lxc build                       # 默认读取 ./Incusfile
+# 构建镜像（默认读取 ./Incusfile）
+sb_lxc build
 
-# 只构建镜像，不启动容器
-sb_lxc build --image-only
-
-# 覆盖镜像别名/容器名
+# 覆盖镜像别名
 sb_lxc build --name my-app
 
 # 指定 Incusfile 路径
 sb_lxc build path/to/MyIncusfile
 
-# 从已构建镜像启动容器（读取构建时保存的 EXPOSE/DOMAIN/AUTOSTART）
-sb_lxc run my-nginx
+# 从 ./Incusfile 读取镜像名并启动容器（EXPOSE/DOMAIN/AUTOSTART 取自 Incusfile）
+sb_lxc run
 
-# 交互式引导生成 Incusfile
-sb_lxc image init
-sb_lxc image init path/to/Incusfile
+# 启动时覆盖容器名
+sb_lxc run my-container
 ```
 
 ### 完整示例：一键构建 Nginx 站点
@@ -293,10 +287,11 @@ AUTOSTART on
 <h1>Hello from sb_lxc build!</h1>
 ```
 
-**一键构建并启动**
+**构建镜像并启动**
 ```bash
 cd my-site/
-sb_lxc build
+sb_lxc build      # 构建镜像
+sb_lxc run        # 从 ./Incusfile 读取镜像名并启动容器
 ```
 
 输出：
@@ -309,10 +304,10 @@ sb_lxc build
 ╰─
 
 ✔ 镜像已发布: my-nginx
+
+▶ 从镜像 my-nginx 启动容器 my-nginx
 ✔ 域名映射: nginx.test -> 192.168.10.110
 ✔ 端口映射: 80/tcp
-
-✔ 一键构建并启动完成! 镜像=my-nginx  容器=my-nginx
 ```
 
 随后即可在宿主机访问 `http://nginx.test`（已写入 `/etc/hosts`）或 `curl 192.168.10.110:80`。

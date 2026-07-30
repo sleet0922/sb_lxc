@@ -1194,6 +1194,50 @@ func (c *IncusClient) ListLocalImageAliases() ([]string, error) {
 	return names, nil
 }
 
+// GetImageAliasEntry 查询镜像别名是否存在, 存在返回其指向的 fingerprint。
+func (c *IncusClient) GetImageAliasEntry(alias string) (string, error) {
+	if err := c.ready(); err != nil {
+		return "", err
+	}
+	entry, _, err := c.server.GetImageAlias(alias)
+	if err != nil {
+		return "", err
+	}
+	return entry.Target, nil
+}
+
+// DeleteImageByAlias 删除镜像别名及其指向的镜像。
+// 若该镜像还有其他别名引用，仅删除别名保留镜像；否则连镜像一起删除。
+func (c *IncusClient) DeleteImageByAlias(alias string) error {
+	if err := c.ready(); err != nil {
+		return err
+	}
+	entry, _, err := c.server.GetImageAlias(alias)
+	if err != nil {
+		return fmt.Errorf("镜像别名 %s 不存在", alias)
+	}
+	// 删除别名
+	if err := c.server.DeleteImageAlias(alias); err != nil {
+		return fmt.Errorf("删除别名失败: %w", err)
+	}
+	// 检查镜像是否还有其他别名引用
+	aliases, err := c.server.GetImageAliases()
+	if err == nil {
+		for _, a := range aliases {
+			if a.Target == entry.Target {
+				return nil // 仍有其他别名引用，保留镜像
+			}
+		}
+	}
+	// 无其他引用，删除孤儿镜像
+	op, err := c.server.DeleteImage(entry.Target)
+	if err != nil {
+		return nil // 镜像删除失败不阻断，别名已删
+	}
+	_ = op.Wait()
+	return nil
+}
+
 // GetImageProperties 读取本地镜像 (通过别名) 的属性。
 func (c *IncusClient) GetImageProperties(alias string) (map[string]string, error) {
 	if err := c.ready(); err != nil {
