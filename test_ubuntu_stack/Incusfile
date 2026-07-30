@@ -1,0 +1,48 @@
+# Ubuntu 多服务栈 - MariaDB + Redis + Python 应用
+# 测试点：Ubuntu 镜像、多服务集成、预初始化数据库、systemd 拉起多个服务
+# 测试命令：curl http://ubuntu-stack.test/health
+#           curl http://ubuntu-stack.test/api/count
+FROM ubuntu/noble
+NAME ubuntu-stack
+
+# Ubuntu 换清华源
+RUN sed -i 's|http://archive.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g; s|http://security.ubuntu.com|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        mariadb-server redis-server python3 python3-flask python3-pymysql python3-redis curl procps ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && systemctl disable mariadb.service redis-server.service 2>/dev/null || true
+
+# 应用目录 + 数据目录
+RUN mkdir -p /app /var/run/mysqld && chown mysql:mysql /var/run/mysqld
+
+COPY ./init.sql /app/init.sql
+COPY ./app.py /app/app.py
+COPY ./start.sh /app/start.sh
+RUN chmod +x /app/start.sh
+
+# 构建期预初始化 MariaDB (创建数据库 + 表 + 用户)
+RUN for i in 1 2 3 4 5 6 7 8 9 10; do mysqladmin ping 2>/dev/null && break; sleep 1; done && \
+    mysql -u root < /app/init.sql && \
+    mysqladmin -u root shutdown && \
+    sleep 2 && \
+    echo "MariaDB 预初始化完成"
+
+ENV FLASK_APP=/app/app.py
+ENV DB_HOST=127.0.0.1
+ENV DB_USER=appuser
+ENV DB_PASSWORD=apppass123
+ENV DB_NAME=appdb
+ENV REDIS_HOST=127.0.0.1
+ENV REDIS_PORT=6379
+ENV LISTEN_PORT=8083
+
+# systemd 服务 (start.sh 拉起 mariadb/redis/flask)
+# EnvironmentFile 加载 sb_lxc ENV 写入的 /etc/sb_lxc.env
+RUN printf '[Unit]\nDescription=Ubuntu Multi-stack\nAfter=network.target\n\n[Service]\nType=simple\nEnvironmentFile=/etc/sb_lxc.env\nExecStart=/app/start.sh\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/ubuntu-stack.service && \
+    systemctl enable ubuntu-stack.service
+
+# 多端口暴露 (web + db + redis)
+EXPOSE 8083/tcp 3306/tcp 6379/tcp
+DOMAIN ubuntu-stack.test
+AUTOSTART on

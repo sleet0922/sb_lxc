@@ -1,0 +1,38 @@
+# Alpine Nginx - 单阶段轻量级构建
+# 测试点：Alpine 镜像（apk 包管理）、单 FROM、COPY、EXPOSE、DOMAIN、AUTOSTART
+# 测试命令：curl http://alpine-nginx.test:8080/
+# 注：Alpine 用 OpenRC，不走 systemd；start.sh 前台阻塞 init
+FROM alpine/3.21
+NAME alpine-nginx
+
+# Alpine 换清华源加速
+RUN sed -i 's|dl-cdn.alpinelinux.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apk/repositories
+
+# 安装 nginx + curl
+RUN apk add --no-cache nginx curl
+
+# nginx pid 目录 (Alpine 默认 /run/nginx，确保存在)
+RUN mkdir -p /run/nginx /var/www/html
+
+COPY ./index.html /var/www/html/index.html
+
+# nginx 监听 8080 (避免宿主机 80 端口冲突)，前台运行
+RUN printf 'server {\n    listen 8080 default_server;\n    root /var/www/html;\n    index index.html;\n    location / { try_files $uri $uri/ =404; }\n}\n' > /etc/nginx/http.d/default.conf
+
+COPY ./start.sh /start.sh
+COPY ./healthcheck.sh /healthcheck.sh
+RUN chmod +x /start.sh /healthcheck.sh
+
+# OpenRC 服务 (Alpine 用 OpenRC 而非 systemd)
+RUN printf '#!/sbin/openrc-run\nname="alpine-nginx"\ncommand="/start.sh"\ncommand_background=false\ndepend() {\n    need net\n}\n' > /etc/init.d/alpine-nginx && \
+    chmod +x /etc/init.d/alpine-nginx && \
+    rc-update add alpine-nginx default 2>/dev/null || true
+
+# 同时设置 /etc/local.d 启动脚本作为兜底 (OpenRC local 服务)
+RUN printf '#!/bin/sh\n/start.sh &\n' > /etc/local.d/alpine-nginx.start && \
+    chmod +x /etc/local.d/alpine-nginx.start && \
+    rc-update add local default 2>/dev/null || true
+
+EXPOSE 8080/tcp
+DOMAIN alpine-nginx.test
+AUTOSTART on

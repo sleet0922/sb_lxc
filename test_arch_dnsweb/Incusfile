@@ -1,0 +1,43 @@
+# Archlinux DNS + Web - 多服务容器
+# 测试点：Archlinux 镜像（pacman 包管理）、多端口 EXPOSE (TCP+UDP)、ENV 跨指令引用
+# 测试命令：curl http://arch-dnsweb.test/
+#           dig @arch-dnsweb.test arch-dnsweb.test
+FROM archlinux
+NAME arch-dnsweb
+
+# Arch 换清华源
+RUN sed -i '1i Server = https://mirrors.tuna.tsinghua.edu.cn/archlinux/$repo/os/$arch' /etc/pacman.d/mirrorlist
+
+# Arch 容器镜像 PGP keyring 经常过期，容器内 pacman-key 初始化缺少熵源。
+# 这里直接关闭签名校验 (仅限构建期，生产环境应刷新 keyring)
+RUN sed -i 's|^SigLevel.*|SigLevel = Never|' /etc/pacman.conf
+
+# 安装 dnsmasq + python + busybox httpd (轻量 web)
+RUN pacman -Sy --noconfirm dnsmasq python busybox curl && pacman -Scc --noconfirm
+
+# 禁用 systemd-resolved (默认占用 53 端口，与 dnsmasq 冲突)
+RUN systemctl disable systemd-resolved 2>/dev/null || true
+
+# ENV 跨指令引用
+ENV WEB_PORT=8081
+ENV DNS_DOMAIN=arch-dnsweb.test
+ENV DNS_FORWARD=8.8.8.8
+
+# 用 ENV 生成 dnsmasq 配置 (验证 ENV 持久化与引用)
+RUN mkdir -p /etc/dnsmasq.d /var/www/html
+RUN printf 'port=53\nlisten-address=0.0.0.0\nno-resolv\nserver=%s\naddress=/%s/127.0.0.1\nlog-queries\n' "$DNS_FORWARD" "$DNS_DOMAIN" > /etc/dnsmasq.d/sb-lxc.conf
+
+COPY ./index.html /var/www/html/index.html
+
+# 启动脚本: 同时拉起 dnsmasq 和 busybox httpd
+COPY ./start.sh /start.sh
+RUN chmod +x /start.sh
+
+# systemd 服务
+RUN printf '[Unit]\nDescription=Arch DNS+Web\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=/start.sh\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/arch-dnsweb.service && \
+    systemctl enable arch-dnsweb.service
+
+# 多端口 + 混合协议
+EXPOSE 8081/tcp 53/udp
+DOMAIN arch-dnsweb.test
+AUTOSTART on
