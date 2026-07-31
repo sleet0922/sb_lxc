@@ -138,6 +138,15 @@ func autoHostShimCIDR(parent string, reserved []net.IP) (string, error) {
 		return cidr, nil
 	}
 
+	// 复用已存在的 shim 地址：shim 接口一旦配置好 /32 地址就长期有效，
+	// 重复执行 ping 探测 (每次约 1s) 是命令延迟的主要来源。
+	// 仅在 shim 尚无地址或地址与容器 IP 冲突时才重新选择。
+	if existing := existingShimCIDR(); existing != "" {
+		if !ipConflictsWithReservedCIDR(existing, reserved) {
+			return existing, nil
+		}
+	}
+
 	hostIP, ipNet, err := firstGlobalIPv4CIDR(parent)
 	if err != nil {
 		return "", err
@@ -149,6 +158,34 @@ func autoHostShimCIDR(parent string, reserved []net.IP) (string, error) {
 		return "", err
 	}
 	return candidate.String() + "/32", nil
+}
+
+// existingShimCIDR 返回 sb-lxc-mv 接口上已配置的全局 /32 IPv4 CIDR。
+// 不存在或非 /32 时返回空串，触发重新选择。
+func existingShimCIDR() string {
+	out, err := exec.Command("ip", "-4", "-o", "addr", "show", "dev", defaultHostMacvlanName, "scope", "global").Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		for i, field := range fields {
+			if field != "inet" || i+1 >= len(fields) {
+				continue
+			}
+			cidr := fields[i+1]
+			ip, ipNet, err := net.ParseCIDR(cidr)
+			if err != nil || ip == nil || ip.To4() == nil {
+				continue
+			}
+			ones, bits := ipNet.Mask.Size()
+			if bits != 32 || ones != 32 {
+				continue
+			}
+			return cidr
+		}
+	}
+	return ""
 }
 
 func firstGlobalIPv4CIDR(parent string) (net.IP, *net.IPNet, error) {

@@ -3,10 +3,11 @@ package main
 import (
 	"fmt"
 	"os"
+	"sync"
 )
 
 // Version 工具版本
-const Version = "1.9.1"
+const Version = "1.9.2"
 
 // MirrorRemote 镜像源在本地的 remote 名称
 const MirrorRemote = "mirror-images"
@@ -32,12 +33,24 @@ func main() {
 		return
 	}
 
-	// 重量级命令：执行启动期副作用（网络探测、网桥清理、macvlan shim 维护）
-	client := NewIncusClient()
-	client.EnsureMirrorRemote()
-	warnAutoHostMacvlan(client.EnsureDefaultMacvlanProfile())
-	_ = client.AutoCleanupUnusedBridges()
-	warnAutoHostMacvlan(AutoConfigureHostMacvlan(client))
+	// 启动期副作用按命令分层执行，避免只读命令承担不必要的网络探测开销。
+	// - needsStartupSideEffects: 仅容器创建/启动类命令需要确保 default profile 的
+	//   macvlan 配置就绪并清理遗留的 incusbr0 网桥；只读命令 (list/in/exec/set/stop/...)
+	//   无需这些副作用，直接连接 Incus 即可，显著降低延迟。
+	// - AutoConfigureHostMacvlan 不在 main 中调用：start/install/import/create 等命令
+	//   会在容器获取 IPv4 后自行调用；main 提前调用既冗余（被它启动的容器此时还未运行、
+	//   不在目标列表里），又会触发额外的 ping 探测，是命令延迟的主要来源。
+	if needsStartupSideEffects(cmd) {
+		client := NewIncusClient()
+		client.EnsureMirrorRemote()
+		// 两个维护任务相互独立，并行执行以缩短启动延迟。
+		// Incus REST 客户端底层基于 http.Client，可安全并发使用。
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); warnAutoHostMacvlan(client.EnsureDefaultMacvlanProfile()) }()
+		go func() { defer wg.Done(); _ = client.AutoCleanupUnusedBridges() }()
+		wg.Wait()
+	}
 
 	if err := dispatch(cmd, args); err != nil {
 		fmt.Fprintf(os.Stderr, "✘ %v\n", err)
@@ -45,11 +58,24 @@ func main() {
 	}
 }
 
-// isLightweightCommand 判断命令是否为轻量级（无需网络探测）。
-// help/version 等只读命令跳过启动期副作用，保证即时响应。
+// isLightweightCommand 判断命令是否为轻量级（无需连接 Incus）。
+// help/version 等纯本地命令跳过所有启动期副作用，保证即时响应。
 func isLightweightCommand(cmd string) bool {
 	switch cmd {
 	case "help", "-h", "--help", "--version", "-v", "version":
+		return true
+	}
+	return false
+}
+
+// needsStartupSideEffects 判断命令是否需要执行启动期维护副作用
+// (EnsureDefaultMacvlanProfile + AutoCleanupUnusedBridges)。
+// 只有创建/启动容器的命令需要 default profile 的 macvlan 配置就绪；
+// 只读或纯配置命令 (list/images/in/exec/set/stop/remove/export) 跳过，
+// 直接连接 Incus 执行，避免每次都做网络探测与网桥扫描带来的延迟。
+func needsStartupSideEffects(cmd string) bool {
+	switch cmd {
+	case "install", "i", "create", "run", "build", "import", "start", "restart":
 		return true
 	}
 	return false
